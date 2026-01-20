@@ -63,13 +63,25 @@ with VDevice(params) as target:
             
             print(f"[Debug] Final Prediction Shape: {prediction.shape}")
 
-# 4. 후처리 (간이 버전: 가장 높은 점수의 객체 찾기)
-print(f"[3] Post-processing...")
-class_scores = prediction[:, 4:] # 뒤쪽 80개가 클래스 확률
-max_scores = np.max(class_scores, axis=1) # 각 박스별 최대 확률
-best_idx = np.argmax(max_scores) # 전체 8400개 중 1등 인덱스
-best_score = max_scores[best_idx]
-class_id = np.argmax(class_scores[best_idx])
+# [3] Post-processing (탐색 모드)
+print(f"\n[3] Inspection Mode: Listing ALL Output Layers...")
+
+# 딕셔너리에 들어있는 모든 키와 데이터 모양(Shape)을 출력합니다.
+for key, value in raw_output.items():
+    print(f"\n=== Layer Name: '{key}' ===")
+    
+    # 데이터 꺼내기 (리스트 껍질 벗기기)
+    data = value
+    while isinstance(data, list):
+        data = data[0]
+    
+    print(f" - Final Shape: {data.shape}")
+    
+    # 힌트: 우리가 찾는 건 '84' 또는 '80'이라는 숫자가 포함된 큰 녀석입니다.
+    if 84 in data.shape or 80 in data.shape:
+        print(" -> [TARGET FOUND] ★ This looks like the detection head!")
+    else:
+        print(" -> (Too small or wrong shape, skipping...)")
 
 # 5. 결과 시각화
 if best_score > 0.5: # 50% 이상 확실할 때만
