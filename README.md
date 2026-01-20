@@ -39,14 +39,29 @@ with VDevice(params) as target:
             raw_output = pipeline.infer({input_info.name: input_data})
             
             # 결과 텐서 추출 (Batch, 84, 8400)
-            # API 버전에 따라 리스트 구조가 다를 수 있어 안전하게 추출
-            output_tensor = list(raw_output.values())[0]
-            if isinstance(output_tensor, list): output_tensor = output_tensor[0]
-            if isinstance(output_tensor, list): output_tensor = output_tensor[0]
+            # [수정] 무적의 Shape 처리 로직
+            # 1. 딕셔너리에서 값 꺼내기
+            output_data = list(raw_output.values())[0]
+
+            # 2. 리스트 껍질이 나올 때까지 계속 벗기기 (Recursive Unwrapping)
+            while isinstance(output_data, list):
+                output_data = output_data[0]
+
+            print(f"[Debug] Raw Tensor Shape: {output_data.shape}")
+
+            # 3. 차원에 따른 자동 대응
+            if output_data.ndim == 3:
+                # (1, 84, 8400) -> 배치 차원 제거 -> (84, 8400)
+                output_data = output_data[0]
             
-            # (1, 84, 8400) -> (8400, 84)로 전치(Transpose)
-            # YOLOv8 output: [cx, cy, w, h, class_probs...]
-            prediction = np.transpose(output_tensor[0], (1, 0))
+            # 4. (84, 8400) -> (8400, 84)로 전치
+            # 만약 이미 (8400, 84)라면 전치 생략
+            if output_data.shape[0] < output_data.shape[1]: 
+                prediction = np.transpose(output_data, (1, 0))
+            else:
+                prediction = output_data
+            
+            print(f"[Debug] Final Prediction Shape: {prediction.shape}")
 
 # 4. 후처리 (간이 버전: 가장 높은 점수의 객체 찾기)
 print(f"[3] Post-processing...")
