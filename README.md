@@ -82,5 +82,15 @@ else:
 
 Error
 ```
+[1] Loading & Preprocessing zidane.jpg...
+[2] Running Inference on Hailo-8...
+Traceback (most recent call last):
+  File "/workspace/testv8n/verify_yolo.py", line 45, in <module>
+    prediction = np.transpose(output_tensor[0], (1, 0))
+  File "/usr/local/lib/python3.10/dist-packages/numpy/core/fromnumeric.py", line 655, in transpose
+    return _wrapfunc(a, 'transpose', axes)
+  File "/usr/local/lib/python3.10/dist-packages/numpy/core/fromnumeric.py", line 59, in _wrapfunc
+    return bound(*args, **kwds)
+ValueError: axes don't match array
 
 ```
