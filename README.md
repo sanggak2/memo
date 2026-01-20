@@ -53,10 +53,10 @@ with VDevice(params) as target:
             
             print(f"\n[Success] Inference Logic Complete! ({dt*1000:.2f}ms)")
             for name, data in output.items():
-            if isinstance(data, list):
-                print(f" - Output Layer '{name}': Shape {data[0].shape}")
-            else:
-                print(f" - Output Layer '{name}': Shape {data.shape}")
+                if isinstance(data, list):
+                    print(f" - Output Layer '{name}': Shape {data[0].shape}")
+                else:
+                    print(f" - Output Layer '{name}': Shape {data.shape}")
 
 print(f"\n[Done] Total Check Time: {time.time() - start_time:.2f}s")
 ```
