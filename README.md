@@ -56,54 +56,37 @@ print(f"\n[Done] Total Check Time: {time.time() - start_time:.2f}s")
 
 Error
 ```
-import numpy as np
-import time
-from hailo_platform import VDevice, HailoStreamInterface, InferVStreams, ConfigureParams, InputVStreamParams, OutputVStreamParams, FormatType, HEF
+[Init] Loading yolov8n.hef on Hailo-8...
+Traceback (most recent call last):
+  File "/workspace/testv8n/test_yolo.py", line 12, in <module>
+    hef = target.create_hef(hef_path)
+AttributeError: 'VDevice' object has no attribute 'create_hef'
+root@user-desktop:/workspace/testv8n# nano test_yolo.py
+root@user-desktop:/workspace/testv8n# ls
+hailort.log  test_yolo.py  yolov8n.hef
+root@user-desktop:/workspace/testv8n# nano test_yolo.py
+root@user-desktop:/workspace/testv8n# python3 test_yolo.py
+[Init] Loading yolov8n.hef...
+[Run] Starting Inference with Dummy Data...
+[HailoRT] [error] CHECK failed - Trying to write to vstream yolov8n/input_layer1 before its network group is activated
+[HailoRT] [error] CHECK_SUCCESS failed with status=HAILO_NETWORK_GROUP_NOT_ACTIVATED(69)
+[HailoRT] [error] Failed waiting for threads with status HAILO_NETWORK_GROUP_NOT_ACTIVATED(69)
+[HailoRT] [error] Failed waiting for threads with status HAILO_NETWORK_GROUP_NOT_ACTIVATED(69)
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 974, in infer
+    self._infer_pipeline.infer(input_data, output_buffers, batch_size)
+hailo_platform.pyhailort._pyhailort.HailoRTStatusException: 69
 
-# 1. 모델 경로
-hef_path = "yolov8n.hef"
+The above exception was the direct cause of the following exception:
 
-print(f"[Init] Loading {hef_path}...")
-start_time = time.time()
-
-# 2. VDevice(NPU) 연결
-params = VDevice.create_params()
-with VDevice(params) as target:
-    
-    # [수정된 부분] HEF 파일을 클래스로 직접 로드
-    hef = HEF(hef_path)
-    
-    # 3. 네트워크 설정 (PCIe)
-    configure_params = ConfigureParams.create_from_hef(hef, interface=HailoStreamInterface.PCIe)
-    network_groups = target.configure(hef, configure_params)
-    network_group = network_groups[0]
-    
-    # 4. 스트림 파라미터 설정
-    input_params = InputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
-    output_params = OutputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
-
-    # 5. 추론 실행
-    with InferVStreams(network_group, input_params, output_params) as pipeline:
-        input_info = network_group.get_input_vstream_infos()[0]
-        # 더미 데이터 (Batch, H, W, Ch)
-        input_data = {
-            input_info.name: np.random.random((1, 640, 640, 3)).astype(np.float32)
-        }
-        
-        print("[Run] Starting Inference with Dummy Data...")
-        
-        # 워밍업
-        for _ in range(3): 
-            pipeline.infer(input_data)
-            
-        # 실제 측정
-        t0 = time.time()
-        output = pipeline.infer(input_data)
-        dt = time.time() - t0
-        
-        print(f"\n[Success] Inference Logic Complete! ({dt*1000:.2f}ms)")
-        for name, data in output.items():
-            print(f" - Output Layer '{name}': Shape {data.shape}")
-
-print(f"\n[Done] Total Check Time: {time.time() - start_time:.2f}s")
+Traceback (most recent call last):
+  File "/workspace/testv8n/test_yolo.py", line 39, in <module>
+    pipeline.infer(input_data)
+  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 972, in infer
+    with ExceptionWrapper():
+  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 122, in __exit__
+    self._raise_indicative_status_exception(value)
+  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 172, in _raise_indicative_status_exception
+    raise self.create_exception_from_status(error_code) from libhailort_exception
+hailo_platform.pyhailort.pyhailort.HailoRTNetworkGroupNotActivatedException: Network group is not activated
 ```
