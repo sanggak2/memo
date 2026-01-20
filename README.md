@@ -131,17 +131,12 @@ Error
 ```
 [1] Loading & Preprocessing zidane.jpg...
 [2] Running Inference on Hailo-8...
-[Debug] Raw Tensor Shape: (3, 5)
-[Debug] Final Prediction Shape: (5, 3)
-[3] Post-processing...
-Traceback (most recent call last):
-  File "/workspace/testv8n/verify_yolo.py", line 65, in <module>
-    max_scores = np.max(class_scores, axis=1) # 각 박스별 최대 확률
-  File "/usr/local/lib/python3.10/dist-packages/numpy/core/fromnumeric.py", line 2810, in max
-    return _wrapreduction(a, np.maximum, 'max', axis, None, out,
-  File "/usr/local/lib/python3.10/dist-packages/numpy/core/fromnumeric.py", line 88, in _wrapreduction
-    return ufunc.reduce(obj, axis, dtype, out, **passkwargs)
-ValueError: zero-size array to reduction operation maximum which has no identity
+
+[Analysis] Searching for Detection Head...
+ - Checking Layer 'yolov8n/yolov8_nms_postprocess': Shape (3, 5)
+   -> (Skipping metadata/aux layer)
+[Error] Failed to find a layer with '8400' anchors.
+
 
 
 ```
