@@ -1,6 +1,7 @@
 # memo
 오픈 메모장
 
+```
 import numpy as np
 import time
 from hailo_platform import VDevice, HailoStreamInterface, InferVStreams, ConfigureParams, InputVStreamParams, OutputVStreamParams, FormatType
@@ -39,3 +40,4 @@ with VDevice(params) as target:
             print(f" - Output Layer '{name}': Shape {data.shape}")
 
 print(f"\n[Done] Total Check Time: {time.time() - start_time:.2f}s")
+```
