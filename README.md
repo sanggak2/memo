@@ -52,11 +52,30 @@ with VDevice(params) as target:
             dt = time.time() - t0
             
             print(f"\n[Success] Inference Logic Complete! ({dt*1000:.2f}ms)")
+            # [수정] 결과 데이터 타입 및 구조 확인 (Debug Mode)
+            print("\n[Result Analysis]")
             for name, data in output.items():
+                print(f"Layer: '{name}'")
+                print(f" - Type: {type(data)}")
+            
+                # 1. 만약 리스트라면?
                 if isinstance(data, list):
-                    print(f" - Output Layer '{name}': Shape {data[0].shape}")
+                    print(f" - Is List! Length: {len(data)}")
+                    if len(data) > 0:
+                        print(f" - Element 0 Type: {type(data[0])}")
+                        # 리스트 안에 또 리스트가 있는지, 아니면 배열이 있는지 확인
+                        if hasattr(data[0], 'shape'):
+                             print(f" - Element 0 Shape: {data[0].shape}")
+                        else:
+                             print(f" - Element 0 Content: {data[0]}")
+            
+                # 2. 만약 넘파이 배열이라면?
+                elif isinstance(data, np.ndarray):
+                    print(f" - Is Numpy Array! Shape: {data.shape}")
+                
+                # 3. 그 외
                 else:
-                    print(f" - Output Layer '{name}': Shape {data.shape}")
+                    print(f" - Unknown Content: {data}")
 
 print(f"\n[Done] Total Check Time: {time.time() - start_time:.2f}s")
 ```
