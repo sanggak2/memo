@@ -3,70 +3,84 @@
 
 ```
 import numpy as np
-import time
+import cv2
 from hailo_platform import VDevice, HailoStreamInterface, InferVStreams, ConfigureParams, InputVStreamParams, OutputVStreamParams, FormatType, HEF
 
-# 1. 모델 경로
+# 1. 설정
 hef_path = "yolov8n.hef"
+image_path = "zidane.jpg"
+labels = {0: "person", 56: "tie"} # COCO 클래스 일부 (테스트용)
 
-print(f"[Init] Loading {hef_path}...")
-start_time = time.time()
+# 2. 이미지 전처리 (Letterbox 없이 단순 Resize for Test)
+# 실제로는 비율 유지(Letterbox)를 해야 정확도가 높지만, 검증용으론 이걸로 충분합니다.
+print(f"[1] Loading & Preprocessing {image_path}...")
+orig_img = cv2.imread(image_path)
+h, w, _ = orig_img.shape
+input_img = cv2.resize(orig_img, (640, 640))
+input_img = cv2.cvtColor(input_img, cv2.COLOR_BGR2RGB)
+input_data = np.expand_dims(input_img, axis=0).astype(np.float32) # (1, 640, 640, 3)
 
-# 2. VDevice(NPU) 연결
+# 3. NPU 추론
+print(f"[2] Running Inference on Hailo-8...")
 params = VDevice.create_params()
 with VDevice(params) as target:
-    
-    # 2.1 HEF 파일 로드
     hef = HEF(hef_path)
-    
-    # 3. 네트워크 설정 (PCIe) - 리소스 예약 단계
     configure_params = ConfigureParams.create_from_hef(hef, interface=HailoStreamInterface.PCIe)
     network_groups = target.configure(hef, configure_params)
     network_group = network_groups[0]
     
-    # 4. 스트림 파라미터 설정
     input_params = InputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
     output_params = OutputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
 
-    # [핵심 수정] 네트워크 그룹 활성화 (Activate)
-    # 하드웨어 엔진을 켜는 단계입니다. 이게 없으면 추론이 불가능합니다.
     with network_group.activate():
-
-        # 5. 추론 실행 파이프라인
         with InferVStreams(network_group, input_params, output_params) as pipeline:
             input_info = network_group.get_input_vstream_infos()[0]
-            # 더미 데이터 생성 (Batch, H, W, Ch)
-            input_data = {
-                input_info.name: np.random.random((1, 640, 640, 3)).astype(np.float32)
-            }
+            # Inference
+            raw_output = pipeline.infer({input_info.name: input_data})
             
-            print("[Run] Starting Inference with Dummy Data...")
+            # 결과 텐서 추출 (Batch, 84, 8400)
+            # API 버전에 따라 리스트 구조가 다를 수 있어 안전하게 추출
+            output_tensor = list(raw_output.values())[0]
+            if isinstance(output_tensor, list): output_tensor = output_tensor[0]
+            if isinstance(output_tensor, list): output_tensor = output_tensor[0]
             
-            # 워밍업 (Warm-up)
-            for _ in range(3): 
-                pipeline.infer(input_data)
-                
-            # 실제 성능 측정
-            t0 = time.time()
-            output = pipeline.infer(input_data)
-            dt = time.time() - t0
-            
-            print(f"\n[Success] Inference Logic Complete! ({dt*1000:.2f}ms)")
-            for name, data in output.items():
-                print(f" - Output Layer '{name}': Shape {data[0][0].shape}")
+            # (1, 84, 8400) -> (8400, 84)로 전치(Transpose)
+            # YOLOv8 output: [cx, cy, w, h, class_probs...]
+            prediction = np.transpose(output_tensor[0], (1, 0))
 
-print(f"\n[Done] Total Check Time: {time.time() - start_time:.2f}s")
+# 4. 후처리 (간이 버전: 가장 높은 점수의 객체 찾기)
+print(f"[3] Post-processing...")
+class_scores = prediction[:, 4:] # 뒤쪽 80개가 클래스 확률
+max_scores = np.max(class_scores, axis=1) # 각 박스별 최대 확률
+best_idx = np.argmax(max_scores) # 전체 8400개 중 1등 인덱스
+best_score = max_scores[best_idx]
+class_id = np.argmax(class_scores[best_idx])
+
+# 5. 결과 시각화
+if best_score > 0.5: # 50% 이상 확실할 때만
+    # 좌표 복원 (0~640 스케일 -> 원본 이미지 스케일)
+    box = prediction[best_idx, :4]
+    cx, cy, bw, bh = box
+    x1 = int((cx - bw/2) * w / 640)
+    y1 = int((cy - bh/2) * h / 640)
+    x2 = int((cx + bw/2) * w / 640)
+    y2 = int((cy + bh/2) * h / 640)
+
+    label_text = f"{labels.get(class_id, f'Class {class_id}')}: {best_score:.2f}"
+    print(f"\n[DETECTED] {label_text} at [{x1}, {y1}, {x2}, {y2}]")
+    
+    # 박스 그리기
+    cv2.rectangle(orig_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    cv2.putText(orig_img, label_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+    
+    # 저장
+    cv2.imwrite("result.jpg", orig_img)
+    print(f"[Success] Saved visualization to 'result.jpg'")
+else:
+    print(f"[Fail] No object detected (Max score: {best_score:.2f})")
 ```
 
 Error
 ```
-[Result Analysis]
-Layer: 'yolov8n/yolov8_nms_postprocess'
- - Type: <class 'list'>
- - Is List! Length: 1
- - Element 0 Type: <class 'list'>
- - Element 0 Content: [array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64), array([], shape=(0, 5), dtype=float64)]
-
-[Done] Total Check Time: 0.27s
 
 ```
