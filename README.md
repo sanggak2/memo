@@ -16,10 +16,10 @@ start_time = time.time()
 params = VDevice.create_params()
 with VDevice(params) as target:
     
-    # [수정된 부분] HEF 파일을 클래스로 직접 로드
+    # 2.1 HEF 파일 로드
     hef = HEF(hef_path)
     
-    # 3. 네트워크 설정 (PCIe)
+    # 3. 네트워크 설정 (PCIe) - 리소스 예약 단계
     configure_params = ConfigureParams.create_from_hef(hef, interface=HailoStreamInterface.PCIe)
     network_groups = target.configure(hef, configure_params)
     network_group = network_groups[0]
@@ -28,65 +28,37 @@ with VDevice(params) as target:
     input_params = InputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
     output_params = OutputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
 
-    # 5. 추론 실행
-    with InferVStreams(network_group, input_params, output_params) as pipeline:
-        input_info = network_group.get_input_vstream_infos()[0]
-        # 더미 데이터 (Batch, H, W, Ch)
-        input_data = {
-            input_info.name: np.random.random((1, 640, 640, 3)).astype(np.float32)
-        }
-        
-        print("[Run] Starting Inference with Dummy Data...")
-        
-        # 워밍업
-        for _ in range(3): 
-            pipeline.infer(input_data)
+    # [핵심 수정] 네트워크 그룹 활성화 (Activate)
+    # 하드웨어 엔진을 켜는 단계입니다. 이게 없으면 추론이 불가능합니다.
+    with network_group.activate():
+
+        # 5. 추론 실행 파이프라인
+        with InferVStreams(network_group, input_params, output_params) as pipeline:
+            input_info = network_group.get_input_vstream_infos()[0]
+            # 더미 데이터 생성 (Batch, H, W, Ch)
+            input_data = {
+                input_info.name: np.random.random((1, 640, 640, 3)).astype(np.float32)
+            }
             
-        # 실제 측정
-        t0 = time.time()
-        output = pipeline.infer(input_data)
-        dt = time.time() - t0
-        
-        print(f"\n[Success] Inference Logic Complete! ({dt*1000:.2f}ms)")
-        for name, data in output.items():
-            print(f" - Output Layer '{name}': Shape {data.shape}")
+            print("[Run] Starting Inference with Dummy Data...")
+            
+            # 워밍업 (Warm-up)
+            for _ in range(3): 
+                pipeline.infer(input_data)
+                
+            # 실제 성능 측정
+            t0 = time.time()
+            output = pipeline.infer(input_data)
+            dt = time.time() - t0
+            
+            print(f"\n[Success] Inference Logic Complete! ({dt*1000:.2f}ms)")
+            for name, data in output.items():
+                print(f" - Output Layer '{name}': Shape {data.shape}")
 
 print(f"\n[Done] Total Check Time: {time.time() - start_time:.2f}s")
 ```
 
 Error
 ```
-[Init] Loading yolov8n.hef on Hailo-8...
-Traceback (most recent call last):
-  File "/workspace/testv8n/test_yolo.py", line 12, in <module>
-    hef = target.create_hef(hef_path)
-AttributeError: 'VDevice' object has no attribute 'create_hef'
-root@user-desktop:/workspace/testv8n# nano test_yolo.py
-root@user-desktop:/workspace/testv8n# ls
-hailort.log  test_yolo.py  yolov8n.hef
-root@user-desktop:/workspace/testv8n# nano test_yolo.py
-root@user-desktop:/workspace/testv8n# python3 test_yolo.py
-[Init] Loading yolov8n.hef...
-[Run] Starting Inference with Dummy Data...
-[HailoRT] [error] CHECK failed - Trying to write to vstream yolov8n/input_layer1 before its network group is activated
-[HailoRT] [error] CHECK_SUCCESS failed with status=HAILO_NETWORK_GROUP_NOT_ACTIVATED(69)
-[HailoRT] [error] Failed waiting for threads with status HAILO_NETWORK_GROUP_NOT_ACTIVATED(69)
-[HailoRT] [error] Failed waiting for threads with status HAILO_NETWORK_GROUP_NOT_ACTIVATED(69)
-Traceback (most recent call last):
-  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 974, in infer
-    self._infer_pipeline.infer(input_data, output_buffers, batch_size)
-hailo_platform.pyhailort._pyhailort.HailoRTStatusException: 69
 
-The above exception was the direct cause of the following exception:
-
-Traceback (most recent call last):
-  File "/workspace/testv8n/test_yolo.py", line 39, in <module>
-    pipeline.infer(input_data)
-  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 972, in infer
-    with ExceptionWrapper():
-  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 122, in __exit__
-    self._raise_indicative_status_exception(value)
-  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 172, in _raise_indicative_status_exception
-    raise self.create_exception_from_status(error_code) from libhailort_exception
-hailo_platform.pyhailort.pyhailort.HailoRTNetworkGroupNotActivatedException: Network group is not activated
 ```
