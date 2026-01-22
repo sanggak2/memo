@@ -2,107 +2,199 @@
 오픈 메모장
 
 ```
-import numpy as np
 import cv2
-from hailo_platform import VDevice, HailoStreamInterface, InferVStreams, ConfigureParams, InputVStreamParams, OutputVStreamParams, FormatType, HEF
+import time
+import argparse
+import sys
+import os
+import numpy as np
+import csv
+from datetime import datetime
+import psutil
 
-# ==========================================
-# 1. 설정
-# ==========================================
-hef_path = "yolov8n.hef"
-image_path = "zidane.jpg"
-# NMS 모델은 보통 클래스 ID가 score에 포함되거나 별도로 나옵니다. 
-# 일단 5개 속성(ymin, xmin, ymax, xmax, score)이라고 가정하고 찍어봅니다.
+# =========================================================================
+# [설정] 사용자 파일 경로 지정 (여기만 수정하면 됩니다)
+# =========================================================================
+DEFAULT_VIDEO_PATH = "/workspace/NonDureong.mp4"
+DEFAULT_HEF_PATH   = "/workspace/yolop.hef"
+# =========================================================================
 
-print(f"[1] Loading & Preprocessing {image_path}...")
-orig_img = cv2.imread(image_path)
-if orig_img is None: exit("Image not found")
-h, w, _ = orig_img.shape
+# Hailo 라이브러리 임포트
+try:
+    from hailo_platform import (HEF, VDevice, HailoStreamInterface, InferVStreams, 
+                                ConfigureParams, InputVStreamParams, OutputVStreamParams, FormatType)
+except ImportError:
+    print("[CRITICAL] 'hailo-platform' 라이브러리가 없습니다. (pip install hailo_platform)")
+    sys.exit(1)
 
-# 단순 Resize (640x640)
-input_img = cv2.resize(orig_img, (640, 640))
-input_img = cv2.cvtColor(input_img, cv2.COLOR_BGR2RGB)
-input_data = np.expand_dims(input_img, axis=0).astype(np.float32)
+def get_system_temp():
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+            return int(f.read().strip()) / 1000.0
+    except:
+        return -1
 
-# ==========================================
-# 2. NPU 추론
-# ==========================================
-print(f"[2] Running Inference on Hailo-8 (NMS Mode)...")
-params = VDevice.create_params()
-
-with VDevice(params) as target:
-    hef = HEF(hef_path)
-    configure_params = ConfigureParams.create_from_hef(hef, interface=HailoStreamInterface.PCIe)
-    network_groups = target.configure(hef, configure_params)
-    network_group = network_groups[0]
-    
-    input_params = InputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
-    output_params = OutputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
-
-    with network_group.activate():
-        with InferVStreams(network_group, input_params, output_params) as pipeline:
-            input_info = network_group.get_input_vstream_infos()[0]
-            
-            # 추론
-            raw_output = pipeline.infer({input_info.name: input_data})
-            
-            # 데이터 추출 (첫 번째 레이어)
-            output_data = list(raw_output.values())[0]
-            
-            # 리스트 껍질 벗기기
-            while isinstance(output_data, list):
-                output_data = output_data[0]
-                
-            print(f"\n[Debug] Output Shape: {output_data.shape}")
-            print(f"[Debug] Raw Data Content:\n{output_data}")
-
-# ==========================================
-# 3. 결과 해석 및 그리기 (NMS Output)
-# ==========================================
-# 가정: Hailo NMS 포맷은 보통 [ymin, xmin, ymax, xmax, score] 순서 (정규화된 0~1 좌표)
-# 데이터가 (3, 5)라면 3개의 객체가 검출된 것.
-
-detections = output_data
-if detections.ndim == 1: # (5,) 처럼 나오면 차원 추가
-    detections = np.expand_dims(detections, axis=0)
-
-print(f"\n[3] Visualizing {len(detections)} detections...")
-
-for i, det in enumerate(detections):
-    # 값 5개 추출 (순서는 모델마다 다를 수 있으나 보통 ymin, xmin, ymax, xmax, score)
-    # Hailo Defalut: ymin, xmin, ymax, xmax, score
-    ymin, xmin, ymax, xmax, score = det[:5]
-    
-    print(f" - Det {i}: Score={score:.3f}, Box=[{xmin:.2f}, {ymin:.2f}, {xmax:.2f}, {ymax:.2f}]")
-
-    if score > 0.5: # 신뢰도 0.5 이상만
-        # 좌표 복원 (0~1 -> 원본 해상도)
-        x1 = int(xmin * w)
-        y1 = int(ymin * h)
-        x2 = int(xmax * w)
-        y2 = int(ymax * h)
+class StandaloneLogger:
+    def __init__(self, model_path, video_path):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_name = os.path.splitext(os.path.basename(model_path))[0]
         
-        # 그리기
-        cv2.rectangle(orig_img, (x1, y1), (x2, y2), (0, 0, 255), 3)
-        label = f"Obj {i}: {score:.2f}"
-        cv2.putText(orig_img, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        if not os.path.exists("logs"):
+            os.makedirs("logs")
 
-# 저장
-cv2.imwrite("result_nms.jpg", orig_img)
-print(f"[Success] Saved result to 'result_nms.jpg'")
+        self.filename = f"logs/{timestamp}_RPi5_Hailo_{model_name}.csv"
+        self.file = open(self.filename, 'w', newline='')
+        self.writer = csv.writer(self.file)
+
+        # 논문용 헤더 (엑셀에서 열어보기 좋게)
+        self.writer.writerow([
+            'Frame_ID', 'Timestamp', 'FPS', 'E2E_Latency_ms', 'Inference_Time_ms',
+            'CPU_Usage_%', 'CPU_Freq_MHz', 'Memory_Usage_%', 'Temperature_C', 'Model'
+        ])
+        print(f"[INFO] Log file created: {self.filename}")
+
+    def log(self, frame_id, fps, e2e_latency, inf_time, cpu_freq, temp, model):
+        now_time = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        cpu_usage = psutil.cpu_percent(interval=None)
+        mem_usage = psutil.virtual_memory().percent
+        
+        self.writer.writerow([
+            frame_id, now_time, f"{fps:.2f}", f"{e2e_latency:.2f}", f"{inf_time:.2f}",
+            cpu_usage, f"{cpu_freq:.1f}", mem_usage, temp, model
+        ])
+        self.file.flush()
+
+    def close(self):
+        self.file.close()
+
+class HailoWrapper:
+    def __init__(self, hef_path):
+        if not os.path.exists(hef_path):
+            raise FileNotFoundError(f"HEF file not found: {hef_path}")
+            
+        print(f"[Init] Loading HEF: {hef_path}")
+        self.hef = HEF(hef_path)
+        self.target = VDevice()
+        
+        # PCIe 인터페이스 설정
+        self.configure_params = ConfigureParams.create_from_hef(
+            self.hef, interface=HailoStreamInterface.PCIe)
+        self.network_groups = self.target.configure(self.hef, self.configure_params)
+        self.network_group = self.network_groups[0]
+        
+        self.input_vparams = InputVStreamParams.make_from_network_group(
+            self.network_group, quantized=False, format_type=FormatType.FLOAT32)
+        self.output_vparams = OutputVStreamParams.make_from_network_group(
+            self.network_group, quantized=False, format_type=FormatType.FLOAT32)
+        
+        # 입력 레이어 정보 자동 추출
+        input_vstream_info = self.hef.get_input_vstream_infos()[0]
+        self.input_name = input_vstream_info.name
+        self.input_shape = input_vstream_info.shape 
+        self.height = self.input_shape[0]
+        self.width = self.input_shape[1]
+        
+        print(f"[Init] Model Input Shape: {self.input_shape} / Name: {self.input_name}")
+
+        self.pipeline = InferVStreams(self.network_group, self.input_vparams, self.output_vparams)
+        self.pipeline.__enter__()
+
+    def infer(self, input_array):
+        # Dictionary 형태로 변환 (Hailo API 요구사항)
+        input_dict = {self.input_name: input_array}
+        return self.pipeline.infer(input_dict)
+
+    def close(self):
+        self.pipeline.__exit__(None, None, None)
+
+def run_experiment(model_path, video_path):
+    if not os.path.exists(video_path):
+        print(f"[CRITICAL] Video file not found: {video_path}")
+        sys.exit(1)
+
+    print(f"[INFO] Target Video: {video_path}")
+    print(f"[INFO] Target Model: {model_path}")
+
+    try:
+        hailo_wrapper = HailoWrapper(model_path)
+    except Exception as e:
+        print(f"[ERROR] Failed to init Hailo: {e}")
+        sys.exit(1)
+        
+    cap = cv2.VideoCapture(video_path)
+    logger = StandaloneLogger(model_path, video_path)
+
+    print("[SYSTEM] Warming up (10 frames)...", end="", flush=True)
+    for _ in range(10):
+        dummy = np.zeros((1, hailo_wrapper.height, hailo_wrapper.width, 3), dtype=np.float32)
+        hailo_wrapper.infer(dummy)
+    print(" [Ready]")
+
+    print(f"[INFO] Starting Benchmark Loop...")
+    frame_id = 0
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret: 
+                print("[INFO] End of video file.")
+                break
+
+            # 1. E2E 시작
+            t_start_e2e = time.perf_counter()
+
+            # 2. 전처리 (Resize & Normalization)
+            resized = cv2.resize(frame, (hailo_wrapper.width, hailo_wrapper.height))
+            input_data = np.expand_dims(resized, axis=0).astype(np.float32)
+
+            # 3. 추론 (NPU)
+            t_start_inf = time.perf_counter()
+            _ = hailo_wrapper.infer(input_data)
+            t_end_inf = time.perf_counter()
+            
+            # 4. E2E 종료
+            t_end_e2e = time.perf_counter()
+            
+            # 지표 계산
+            inf_time = (t_end_inf - t_start_inf) * 1000
+            e2e_latency = (t_end_e2e - t_start_e2e) * 1000
+            fps = 1000.0 / e2e_latency if e2e_latency > 0 else 0
+            
+            temp = get_system_temp()
+            try:
+                cpu_freq = psutil.cpu_freq().current
+            except:
+                cpu_freq = 0
+
+            # 로그 기록
+            logger.log(frame_id, fps, e2e_latency, inf_time, cpu_freq, temp, model_path)
+
+            if frame_id % 30 == 0:
+                print(f"[{frame_id}] FPS:{fps:.1f} | E2E:{e2e_latency:.1f}ms (Infer:{inf_time:.1f}ms) | Temp:{temp}C", flush=True)
+            frame_id += 1
+
+    except KeyboardInterrupt:
+        print("\n[INFO] Interrupted by user.")
+    except Exception as e:
+        print(f"\n[ERROR] Runtime error: {e}")
+    finally:
+        cap.release()
+        hailo_wrapper.close()
+        logger.close()
+        print(f"[INFO] Experiment Done. Logs saved in 'logs' folder.")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    # 기본값을 사용자가 지정한 파일로 고정
+    parser.add_argument('--model', type=str, default=DEFAULT_HEF_PATH, help='Path to .hef file')
+    parser.add_argument('--video', type=str, default=DEFAULT_VIDEO_PATH, help='Path to video file')
+    args = parser.parse_args()
+    
+    run_experiment(args.model, args.video)
 ```
 
 Error
 ```
-[1] Loading & Preprocessing zidane.jpg...
-[2] Running Inference on Hailo-8...
 
-[Analysis] Searching for Detection Head...
- - Checking Layer 'yolov8n/yolov8_nms_postprocess': Shape (3, 5)
-   -> (Skipping metadata/aux layer)
-[Error] Failed to find a layer with '8400' anchors.
-
-
-![result](https://github.com/user-attachments/assets/339cb64e-7875-4fe2-a067-25c92002351d)
 
 ```
