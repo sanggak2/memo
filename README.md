@@ -195,6 +195,39 @@ if __name__ == "__main__":
 
 Error
 ```
+[INFO] Target Video: NonDureong.mp4
+[INFO] Target Model: yolop.hef
+[Init] Loading HEF: yolop.hef
+[Init] Model Input Shape: (640, 640, 3) / Name: yolop/input_layer1
+[INFO] Log file created: logs/20260123_051004_RPi5_Hailo_yolop.csv
+[SYSTEM] Warming up (10 frames)...[HailoRT] [error] CHECK failed - Trying to write to vstream yolop/input_layer1 before its network group is activated
+[HailoRT] [error] CHECK_SUCCESS failed with status=HAILO_NETWORK_GROUP_NOT_ACTIVATED(69)
+[HailoRT] [error] Failed waiting for threads with status HAILO_NETWORK_GROUP_NOT_ACTIVATED(69)
+[HailoRT] [error] Failed waiting for threads with status HAILO_NETWORK_GROUP_NOT_ACTIVATED(69)
+[HailoRT] [error] Failed waiting for threads with status HAILO_NETWORK_GROUP_NOT_ACTIVATED(69)
+[HailoRT] [error] Failed waiting for threads with status HAILO_NETWORK_GROUP_NOT_ACTIVATED(69)
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 974, in infer
+    self._infer_pipeline.infer(input_data, output_buffers, batch_size)
+hailo_platform.pyhailort._pyhailort.HailoRTStatusException: 69
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/workspace/benchmark.py", line 189, in <module>
+    run_experiment(args.model, args.video)
+  File "/workspace/benchmark.py", line 126, in run_experiment
+    hailo_wrapper.infer(dummy)
+  File "/workspace/benchmark.py", line 101, in infer
+    return self.pipeline.infer(input_dict)
+  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 972, in infer
+    with ExceptionWrapper():
+  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 122, in __exit__
+    self._raise_indicative_status_exception(value)
+  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 172, in _raise_indicative_status_exception
+    raise self.create_exception_from_status(error_code) from libhailort_exception
+hailo_platform.pyhailort.pyhailort.HailoRTNetworkGroupNotActivatedException: Network group is not activated
+Segmentation fault (core dumped)
 
 
 ```
