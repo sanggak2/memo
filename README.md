@@ -1,6 +1,8 @@
 # memo
 오픈 메모장
 
+
+
 선행설정
 CPU GOVERNOR -> PERFORMANCE
 ```
@@ -9,6 +11,10 @@ echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governo
 
 # 확인하는 명령어 (performance라고 4줄 뜨면 성공)
 cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+```
+시간동기화
+```
+t
 ```
 
 동기식
