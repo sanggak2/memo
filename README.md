@@ -348,14 +348,11 @@ Error
 ```
 [INIT] Model has 1 input and 5 outputs.
 [INFO] Starting 4.23.0 Async Benchmark...
-[ERROR] Inference failed: Stream was aborted
-[ERROR] Inference failed: Stream was aborted
 Traceback (most recent call last):
-  File "/workspace/async-benchmark.py", line 147, in <module>
+  File "/workspace/async-benchmark.py", line 149, in <module>
     bench.run_benchmark(args.video)
-  File "/workspace/async-benchmark.py", line 124, in run_benchmark
-    configured_infer_model.wait_for_async_tasks()
-AttributeError: 'ConfiguredInferModel' object has no attribute 'wait_for_async_tasks'. Did you mean: 'wait_for_async_ready'?
-
+  File "/workspace/async-benchmark.py", line 118, in run_benchmark
+    job = configured_infer_model.run_async([bindings], get_callback(i, t_start, bindings, output_buffers))
+TypeError: HailoAsyncBenchmark.run_benchmark.<locals>.get_callback() takes 3 positional arguments but 4 were given
 
 ```
