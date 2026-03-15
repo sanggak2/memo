@@ -332,24 +332,13 @@ if __name__ == "__main__":
 
 Error
 ```
-[HailoRT] [error] CHECK failed - Model has more than one output!
+[INIT] Model has 1 input and 5 outputs.
+[INFO] Starting 4.23.0 Async Benchmark...
 Traceback (most recent call last):
-  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 2941, in output
-    return self.InferStream(self._infer_model.output(name))
-hailo_platform.pyhailort._pyhailort.HailoRTStatusException: 6
+  File "/workspace/async-benchmark.py", line 135, in <module>
+    bench.run_benchmark(args.video)
+  File "/workspace/async-benchmark.py", line 88, in run_benchmark
+    with self.infer_model.activate():
+AttributeError: 'InferModel' object has no attribute 'activate'
 
-The above exception was the direct cause of the following exception:
-
-Traceback (most recent call last):
-  File "/workspace/async-benchmark.py", line 127, in <module>
-    bench = HailoAsyncBenchmark(args.model)
-  File "/workspace/async-benchmark.py", line 48, in __init__
-    self.infer_model.output().set_format_type(FormatType.FLOAT32)
-  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 2940, in output
-    with ExceptionWrapper():
-  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 122, in __exit__
-    self._raise_indicative_status_exception(value)
-  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 172, in _raise_indicative_status_exception
-    raise self.create_exception_from_status(error_code) from libhailort_exception
-hailo_platform.pyhailort.pyhailort.HailoRTInvalidOperationException: Invalid operation. See hailort.log for more information
 ```
