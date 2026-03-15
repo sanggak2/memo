@@ -316,7 +316,7 @@ class HailoAsyncBenchmark:
                     results.append(self.log_queue.get())
 
             # 모든 작업 완료 대기
-            self.target.wait_for_idle() 
+            configured_infer_model.wait_for_async_tasks()
             total_duration = time.time() - start_time_total
 
         # 종료 및 로깅
