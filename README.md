@@ -293,7 +293,7 @@ class HailoAsyncBenchmark:
                     bindings.output(out_info["name"]).set_buffer(empty_buffer)
                     output_buffers[out_info["name"]] = empty_buffer
 
-                def get_callback(f_id, t_st, current_binding):
+                def get_callback(f_id, t_st, current_binding, out_bufs):
                     def cb(completion_info):
                         if completion_info.exception:
                             print(f"[ERROR] Inference failed: {completion_info.exception}")
