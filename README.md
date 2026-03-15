@@ -248,8 +248,13 @@ class HailoAsyncBenchmark:
             
         self.input_name = self.infer_model.inputs[0].name
 
+        self.output_info = []
         for output in self.infer_model.outputs:
             output.set_format_type(FormatType.FLOAT32)
+            self.output_info.append({
+                "name": output.name,
+                "shape": output.shape
+            })
             
         print(f"[INIT] Model has 1 input and {len(self.infer_model.outputs)} outputs.")
 
@@ -281,18 +286,22 @@ class HailoAsyncBenchmark:
                 bindings = configured_infer_model.create_bindings()
                 bindings.input(self.input_name).set_buffer(input_data)
 
+                output_buffers = {}
+                for out_info in self.output_info:
+                    # NPU가 값을 채워넣을 빈 FLOAT32 배열 할당
+                    empty_buffer = np.empty(out_info["shape"], dtype=np.float32)
+                    bindings.output(out_info["name"]).set_buffer(empty_buffer)
+                    output_buffers[out_info["name"]] = empty_buffer
+
                 def get_callback(f_id, t_st, current_binding):
                     def cb(completion_info):
-                        # 1. 에러 체크
                         if completion_info.exception:
                             print(f"[ERROR] Inference failed: {completion_info.exception}")
                         else:
-                            # 2. 레이턴시 계산 및 저장
                             t_end = time.perf_counter()
                             e2e_lat = (t_end - t_st) * 1000.0
                             self.log_queue.put((f_id, e2e_lat))
                         
-                        # 3. 처리가 끝난 메모리 해제
                         if current_binding in ongoing_bindings:
                             ongoing_bindings.remove(current_binding)
                     return cb
