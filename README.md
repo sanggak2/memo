@@ -1,6 +1,16 @@
 # memo
 오픈 메모장
 
+선행설정
+CPU GOVERNOR -> PERFORMANCE
+```
+# CPU 0~3의 거버너를 performance로 일괄 변경
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# 확인하는 명령어 (performance라고 4줄 뜨면 성공)
+cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+```
+
 동기식
 ```
 import time
@@ -197,6 +207,7 @@ import time
 import argparse
 import os
 import cv2
+cv2.setNumThreads(1)
 import numpy as np
 import psutil
 import csv
