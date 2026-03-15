@@ -344,27 +344,15 @@ if __name__ == "__main__":
 
 Error
 ```
-[INIT] Model has 1 input and 5 outputs.
+NIT] Model has 1 input and 5 outputs.
 [INFO] Starting 4.23.0 Async Benchmark...
-[HailoRT] [error] CHECK failed - Trying to get buffer as view for 'model/conv57', while it is not configured as view
+[ERROR] Inference failed: Stream was aborted
 Traceback (most recent call last):
-  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 3351, in run_async
-    cpp_job = self._configured_infer_model.run_async(
-hailo_platform.pyhailort._pyhailort.HailoRTStatusException: 6
-
-The above exception was the direct cause of the following exception:
-
-Traceback (most recent call last):
-  File "/workspace/async-benchmark.py", line 138, in <module>
+  File "/workspace/async-benchmark.py", line 147, in <module>
     bench.run_benchmark(args.video)
-  File "/workspace/async-benchmark.py", line 109, in run_benchmark
-    configured_infer_model.run_async([bindings], get_callback(i, t_start, bindings))
-  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 3350, in run_async
-    with ExceptionWrapper():
-  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 122, in __exit__
-    self._raise_indicative_status_exception(value)
-  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 172, in _raise_indicative_status_exception
-    raise self.create_exception_from_status(error_code) from libhailort_exception
-hailo_platform.pyhailort.pyhailort.HailoRTInvalidOperationException: Invalid operation. See hailort.log for more information
+  File "/workspace/async-benchmark.py", line 124, in run_benchmark
+    self.target.wait_for_idle() 
+AttributeError: 'VDevice' object has no attribute 'wait_for_idle'
+
 
 ```
