@@ -424,5 +424,16 @@ if __name__ == "__main__":
 
 Error
 ```
+[WARN] 우선순위 설정 실패: [Errno 1] Operation not permitted
+[INIT] Loading Hailo HEF...
+[INIT] Model Input Shape: 640x3
+[ERROR] 'InputVStreams' object is not subscriptable
+Traceback (most recent call last):
+  File "/workspace/async-benchmark.py", line 225, in <module>
+    run_final_benchmark_rpi_async(args.model, args.video)
+  File "/workspace/async-benchmark.py", line 195, in run_final_benchmark_rpi_async
+    total_dur = time.time() - start_time_global
+UnboundLocalError: local variable 'start_time_global' referenced before assignment
+Segmentation fault (core dumped)
 
 ```
