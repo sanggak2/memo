@@ -310,13 +310,15 @@ class HailoAsyncBenchmark:
                 ongoing_bindings.append(bindings)
 
                 # 비동기 실행 (Non-blocking)
-                configured_infer_model.run_async([bindings], get_callback(i, t_start, bindings))
-                # 로그 큐에서 데이터 가끔 비워주기 (메모리 관리)
+                job = configured_infer_model.run_async([bindings], get_callback(i, t_start, bindings, output_buffers))
+
+                # 로그 큐에서 데이터 비워주기 (메모리 관리)
                 while not self.log_queue.empty():
                     results.append(self.log_queue.get())
 
             # 모든 작업 완료 대기
-            configured_infer_model.wait_for_async_tasks()
+            if 'job' in locals():
+                job.wait(10000)
             total_duration = time.time() - start_time_total
 
         # 종료 및 로깅
