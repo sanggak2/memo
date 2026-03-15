@@ -350,11 +350,12 @@ Error
 ```
 [INIT] Model has 1 input and 5 outputs.
 [INFO] Starting 4.23.0 Async Benchmark...
+[INFO] Allocated 10 buffer sets. Measurement Started!
 Traceback (most recent call last):
-  File "/workspace/async-benchmark.py", line 149, in <module>
+  File "/workspace/async-benchmark.py", line 151, in <module>
     bench.run_benchmark(args.video)
-  File "/workspace/async-benchmark.py", line 118, in run_benchmark
-    job = configured_infer_model.run_async([bindings], get_callback(i, t_start, bindings, output_buffers))
-TypeError: HailoAsyncBenchmark.run_benchmark.<locals>.get_callback() takes 3 positional arguments but 4 were given
+  File "/workspace/async-benchmark.py", line 121, in run_benchmark
+    configured_infer_model.run_async([bindings], get_callback(i, t_start, bindings, input_buf, output_bufs))
+TypeError: HailoAsyncBenchmark.run_benchmark.<locals>.get_callback() takes 4 positional arguments but 5 were given
 
 ```
