@@ -9,150 +9,188 @@ import cv2
 import numpy as np
 import psutil
 import csv
-from hailo_platform import (HEF, VDevice, HailoStreamInterface, ConfigureParams, InputVStreamParams, OutputVStreamParams, FormatType)
+import threading
+import gc
+import sys
+from datetime import datetime
+
+from hailo_platform import (HEF, VDevice, HailoStreamInterface, ConfigureParams, 
+                            InputVStreamParams, OutputVStreamParams, FormatType, InferVStreams)
 
 # -------------------------------------------------
-# 1. Hailo Wrapper Class (수정됨)
+# 1. System Monitor (Threaded)
 # -------------------------------------------------
-class HailoInference:
-    def __init__(self, hef_path):
-        self.hef_path = hef_path
-        self.target = VDevice()
-        self.hef = HEF(hef_path)
+class SystemMonitor(threading.Thread):
+    def __init__(self, interval=0.5):
+        super().__init__()
+        self.interval = interval
+        self.running = True
+        self.daemon = True
+        self.stats = {"cpu": 0.0, "temp": 0.0}
 
-        # 네트워크 그룹 설정
-        self.configure_params = ConfigureParams.create_from_hef(hef=self.hef, interface=HailoStreamInterface.PCIe)
-        self.network_groups = self.target.configure(self.hef, self.configure_params)
-        self.network_group = self.network_groups[0]
+    def run(self):
+        while self.running:
+            try:
+                self.stats["cpu"] = psutil.cpu_percent(interval=None)
+                try:
+                    with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+                        self.stats["temp"] = int(f.read().strip()) / 1000.0
+                except:
+                    self.stats["temp"] = 0.0
+                time.sleep(self.interval)
+            except:
+                break
 
-        # 입력/출력 스트림 매개변수 설정
-        self.input_vstream_params = InputVStreamParams.make(self.network_group, format_type=FormatType.FLOAT32)
-        self.output_vstream_params = OutputVStreamParams.make(self.network_group, format_type=FormatType.FLOAT32)
-
-        # 입력 정보 가져오기
-        self.input_vstream_infos = self.hef.get_input_vstream_infos()
-        self.input_shape = self.input_vstream_infos[0].shape
-        self.input_name = self.input_vstream_infos[0].name
-        print(f"[Init] Model Input Shape: {self.input_shape} / Name: {self.input_name}")
-
-    def get_input_shape(self):
-        return self.input_shape
-
-    def run(self, video_path, log_path):
-        # -------------------------------------------------
-        # 핵심 수정: activate() 안에서 모든 작업을 수행
-        # -------------------------------------------------
-        with self.network_group.activate(self.network_group_params): 
-            # 파이프라인 생성
-            with self.network_group.create_infer_pipeline(self.input_vstream_params, self.output_vstream_params) as pipeline:
-                
-                # 비디오 로드
-                cap = cv2.VideoCapture(video_path)
-                if not cap.isOpened():
-                    raise RuntimeError(f"Could not open video: {video_path}")
-
-                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                print(f"[INFO] Video Info: {width}x{height}, {total_frames} frames")
-
-                # 워밍업 (더미 데이터로 10회) - 시동 예열
-                print("[SYSTEM] Warming up (10 frames)...")
-                dummy_data = {self.input_name: np.zeros(self.input_shape, dtype=np.float32)}
-                for _ in range(10):
-                    pipeline.infer(dummy_data)
-                print("[SYSTEM] Warmup Done. Starting Benchmark...")
-
-                frame_count = 0
-                
-                # CSV 파일 준비
-                with open(log_path, 'w', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(['Frame', 'Pre_ms', 'Infer_ms', 'Post_ms', 'Total_ms', 'FPS', 'CPU_%', 'Mem_%'])
-
-                    while True:
-                        ret, frame = cap.read()
-                        if not ret:
-                            break
-
-                        frame_count += 1
-                        
-                        # 1. Pre-processing (Resize & Normalize)
-                        t0 = time.time()
-                        resized = cv2.resize(frame, (self.input_shape[1], self.input_shape[0]))
-                        input_data = resized.astype(np.float32) / 255.0
-                        input_data = np.expand_dims(input_data, axis=0) # (1, H, W, C)
-                        input_dict = {self.input_name: input_data}
-                        t1 = time.time()
-
-                        # 2. Inference (NPU)
-                        # activate 상태이므로 여기서 infer 호출 가능
-                        output = pipeline.infer(input_dict)
-                        t2 = time.time()
-
-                        # 3. Post-processing (Dummy for benchmark)
-                        # 실제 후처리는 복잡하므로 시간 측정용 더미 연산만 수행
-                        _ = output 
-                        t3 = time.time()
-
-                        # 시간 계산
-                        pre_time = (t1 - t0) * 1000
-                        infer_time = (t2 - t1) * 1000
-                        post_time = (t3 - t2) * 1000
-                        total_time = (t3 - t0) * 1000
-                        fps = 1000.0 / total_time if total_time > 0 else 0
-
-                        # 시스템 상태
-                        cpu_usage = psutil.cpu_percent()
-                        mem_usage = psutil.virtual_memory().percent
-
-                        # 로그 기록 및 출력
-                        writer.writerow([frame_count, f"{pre_time:.2f}", f"{infer_time:.2f}", f"{post_time:.2f}", f"{total_time:.2f}", f"{fps:.2f}", cpu_usage, mem_usage])
-                        
-                        if frame_count % 10 == 0:
-                            print(f"Frame {frame_count}/{total_frames} | FPS: {fps:.2f} | Infer: {infer_time:.2f}ms")
-
-                cap.release()
-                print(f"[INFO] Benchmark Finished. Log saved to {log_path}")
-
-    # activate 파라미터가 필요없는 버전일 경우를 대비해 속성 추가
-    @property
-    def network_group_params(self):
-        from hailo_platform import ConfigureParams
-        return self.configure_params
+    def stop(self):
+        self.running = False
 
 # -------------------------------------------------
-# Main Execution
+# 2. Benchmark Function
 # -------------------------------------------------
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model', default='yolop.hef', help='Path to .hef model')
-    parser.add_argument('--video', default='NonDureong.mp4', help='Path to input video')
-    args = parser.parse_args()
+def run_final_benchmark_rpi(model_path, video_path):
+    # [최적화] 프로세스 우선순위 격상
+    try:
+        pid = os.getpid()
+        param = os.sched_param(99)
+        os.sched_setscheduler(pid, os.SCHED_FIFO, param)
+        print("[INFO] Process Priority: REAL-TIME (FIFO 99)")
+    except Exception as e:
+        print(f"[WARN] 우선순위 설정 실패: {e}")
 
-    # 결과 저장 폴더 생성
-    os.makedirs("logs", exist_ok=True)
-    log_filename = f"logs/{time.strftime('%Y%m%d_%H%M%S')}_RPi5_Hailo_yolop.csv"
+    # Hailo Init
+    print("[INIT] Loading Hailo HEF...")
+    target = VDevice()
+    hef = HEF(model_path)
+
+    configure_params = ConfigureParams.create_from_hef(hef=hef, interface=HailoStreamInterface.PCIe)
+    network_groups = target.configure(hef, configure_params)
+    network_group = network_groups[0]
+
+    input_vstream_params = InputVStreamParams.make(network_group, format_type=FormatType.UINT8)
+    output_vstream_params = OutputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
+
+    input_vstream_infos = hef.get_input_vstream_infos()
+    input_shape = input_vstream_infos[0].shape
+    input_name = input_vstream_infos[0].name
+    in_h, in_w = input_shape[0], input_shape[1]
     
-    print(f"[INFO] Target Video: {args.video}")
-    print(f"[INFO] Target Model: {args.model}")
+    print(f"[INIT] Model Input Shape: {in_h}x{in_w}")
+
+    cap = cv2.VideoCapture(os.path.abspath(video_path))
+    if not cap.isOpened(): raise RuntimeError("Video Open Failed")
+
+    monitor = SystemMonitor(interval=0.5)
+    monitor.start()
+
+    # 로그 버퍼 (Infer_Lat와 E2E_Lat 두 개 저장)
+    MAX_FRAMES = 5000
+    # (Frame_ID, Timestamp, FPS, Infer_Lat, E2E_Lat, CPU, Temp)
+    log_buffer = [None] * MAX_FRAMES 
+    frame_id = 0
 
     try:
-        hailo_app = HailoInference(args.model)
-        hailo_app.run(args.video, log_filename)
-    except Exception as e:
-        print(f"[ERROR] {e}")
+        with network_group.activate():
+            with InferVStreams(network_group, input_vstream_params, output_vstream_params) as pipeline:
+                
+                print(f"[INFO] 🚀 FINAL RPi+Hailo Benchmark Started (Dual Latency Mode)")
+
+                # 버퍼 비우기 & 워밍업
+                for _ in range(30): cap.read()
+                dummy_data = {input_name: np.zeros((1, in_h, in_w, 3), dtype=np.uint8)}
+                for _ in range(50): pipeline.infer(dummy_data)
+                
+                gc.disable()
+                print("[INFO] Measurement Started!")
+                
+                start_time_global = time.time()
+
+                while True:
+                    ret, frame = cap.read()
+                    if not ret: break
+
+                    # [A] E2E 시작 시간 측정
+                    t_now = time.time()
+                    t_e2e_start = time.perf_counter()
+
+                    # 1. CPU Preprocessing
+                    resized_frame = cv2.resize(frame, (in_w, in_h))
+                    input_data = np.expand_dims(resized_frame, axis=0)
+                    infer_request = {input_name: input_data}
+
+                    # [B] Inference 시작 시간 측정
+                    t_infer_start = time.perf_counter()
+                    
+                    # 2. Inference (PCIe Send -> NPU -> PCIe Recv)
+                    output = pipeline.infer(infer_request)
+                    
+                    # [C] Inference 종료 시간 측정
+                    t_infer_end = time.perf_counter()
+
+                    # 3. CPU Postprocessing (Minimal)
+                    _ = list(output.values())[0]
+
+                    # [D] E2E 종료 시간 측정
+                    t_e2e_end = time.perf_counter()
+
+                    # 계산
+                    infer_latency = (t_infer_end - t_infer_start) * 1000.0
+                    e2e_latency = (t_e2e_end - t_e2e_start) * 1000.0
+                    fps = 1000.0 / e2e_latency if e2e_latency > 0 else 0
+
+                    log_buffer[frame_id] = (
+                        frame_id,
+                        t_now,
+                        fps,
+                        infer_latency, # 순수 추론+전송
+                        e2e_latency,   # 시스템 전체
+                        monitor.stats["cpu"],
+                        monitor.stats["temp"]
+                    )
+
+                    if frame_id % 200 == 0:
+                         print(f"[{frame_id}] FPS: {fps:.1f} | Infer: {infer_latency:.2f}ms | E2E: {e2e_latency:.2f}ms")
+
+                    frame_id += 1
+                    if frame_id >= MAX_FRAMES: break
+
+    except KeyboardInterrupt: pass
+    except Exception as e: print(f"[ERROR] {e}")
+    finally:
+        gc.enable()
+        monitor.stop()
+        total_dur = time.time() - start_time_global
+        cap.release()
+
+        print(f"\n[INFO] Saving data...")
+        os.makedirs("logs", exist_ok=True)
+        log_path = f"logs/bench_rpi_dual_{datetime.now().strftime('%m%d_%H%M')}.csv"
+
+        with open(log_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            # 헤더 수정: Latency가 두 개로 나뉨
+            writer.writerow(["Frame_ID", "Unix_Time", "Timestamp", "System_FPS", "Infer_Latency_ms", "E2E_Latency_ms", "CPU_Usage_Percent", "Temp_C"])
+
+            for i in range(frame_id):
+                fid, ts, fps, inf_lat, e2e_lat, cpu, tmp = log_buffer[i]
+                ts_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S.%f")
+                writer.writerow([fid, f"{ts:.6f}", ts_str, f"{fps:.2f}", f"{inf_lat:.2f}", f"{e2e_lat:.2f}", cpu, tmp])
+
+        print(f"[RESULT] Avg System FPS: {frame_id / total_dur:.2f}")
+        print(f"[RESULT] Saved to {log_path}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', default='yolop_raw.hef', help='Path to .hef model') 
+    parser.add_argument('--video', default='NonDureong.mp4', help='Input video')
+    args = parser.parse_args()
+
+    if os.path.exists(args.model) and os.path.exists(args.video):
+        run_final_benchmark_rpi(args.model, args.video)
+    else:
+        print("[ERROR] File not found.")
 ```
 
 Error
 ```
-[INFO] Target Video: NonDureong.mp4
-[INFO] Target Model: yolop.hef
-[Init] Model Input Shape: (640, 640, 3) / Name: yolop/input_layer1
-[ERROR] activate(): incompatible function arguments. The following argument types are supported:
-    1. (self: hailo_platform.pyhailort._pyhailort.ConfiguredNetworkGroup, arg0: hailo_platform.pyhailort._pyhailort.ActivateNetworkGroupParams) -> hailo_platform.pyhailort._pyhailort.ActivatedApp
-
-Invoked with: <hailo_platform.pyhailort._pyhailort.ConfiguredNetworkGroup object at 0xffff9cd76a30>, {'yolop': <hailo_platform.pyhailort._pyhailort.ConfigureParams object at 0xffff9baaaaf0>}
-
 
 ```
