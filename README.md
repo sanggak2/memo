@@ -301,7 +301,7 @@ class HailoAsyncBenchmark:
                 bindings, input_buf, output_bufs = buffer_pool.get()
                 np.copyto(input_buf, input_data)
 
-                def get_callback(f_id, t_st, current_binding, out_bufs):
+                def get_callback(f_id, t_st, current_binding, curr_in, curr_outs):
                     def cb(completion_info):
                         if completion_info.exception:
                             print(f"[ERROR] Inference failed: {completion_info.exception}")
@@ -313,14 +313,15 @@ class HailoAsyncBenchmark:
                     return cb
 
                 # 비동기 실행
-                configured_infer_model.run_async([bindings], get_callback(i, t_start, bindings, input_buf, output_bufs))
+                job = configured_infer_model.run_async([bindings], get_callback(i, t_start, bindings, input_buf, output_bufs))
 
                 # 로그 큐에서 데이터 비워주기 (메모리 관리)
                 while not self.log_queue.empty():
                     results.append(self.log_queue.get())
 
             # 모든 작업 완료 대기
-            configured_infer_model.wait_for_async_tasks() 
+            if 'job' in locals():
+                job.wait(10000)
             total_duration = time.time() - start_time_total
 
         # 종료 및 로깅
