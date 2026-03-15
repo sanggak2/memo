@@ -231,7 +231,6 @@ class SystemMonitor(threading.Thread):
 # -------------------------------------------------
 class HailoAsyncBenchmark:
     def __init__(self, model_path):
-        # 4.23.0 권장 방식: VDevice 파라미터 설정
         params = VDevice.create_params()
         params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
         
@@ -239,12 +238,21 @@ class HailoAsyncBenchmark:
         self.infer_model = self.target.create_infer_model(model_path)
         
         # 입력/출력 포맷 명시적 설정
-        self.infer_model.input().set_format_type(FormatType.UINT8)
-        self.infer_model.output().set_format_type(FormatType.FLOAT32)
+        self.infer_model.inputs[0].set_format_type(FormatType.UINT8)
+        self.input_shape = self.infer_model.inputs[0].shape
         
-        self.input_shape = self.infer_model.input().shape
-        self.in_h, self.in_w = self.input_shape[1], self.input_shape[2]
-        
+        if len(self.input_shape) == 4:
+            self.in_h, self.in_w = self.input_shape[1], self.input_shape[2]
+        else:
+            self.in_h, self.in_w = self.input_shape[0], self.input_shape[1]
+            
+        self.input_name = self.infer_model.inputs[0].name
+
+        for output in self.infer_model.outputs:
+            output.set_format_type(FormatType.FLOAT32)
+            
+        print(f"[INIT] Model has 1 input and {len(self.infer_model.outputs)} outputs.")
+
         self.log_queue = queue.Queue()
         self.stop_event = threading.Event()
 
@@ -286,7 +294,7 @@ class HailoAsyncBenchmark:
 
                 # 2. 비동기 추론 요청 (Bindings 사용)
                 bindings = self.infer_model.create_bindings()
-                bindings.input().set_buffer(input_data)
+                bindings.input(self.input_name).set_buffer(input_data)
                 
                 # 메타데이터 전달 (시작 시간과 프레임 ID)
                 bindings.context = t_start 
@@ -311,7 +319,6 @@ class HailoAsyncBenchmark:
     def _save_logs(self, results, duration, stats):
         avg_fps = len(results) / duration
         print(f"\n[RESULT] Avg Throughput: {avg_fps:.2f} FPS")
-        # CSV 저장 로직 생략 (기존 코드와 유사)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
