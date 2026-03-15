@@ -256,33 +256,18 @@ class HailoAsyncBenchmark:
         self.log_queue = queue.Queue()
         self.stop_event = threading.Event()
 
-    def callback(self, completion_info, bindings):
-        """추론 완료 시 호출되는 비동기 콜백 함수"""
-        if completion_info.exception:
-            print(f"[ERROR] Inference failed: {completion_info.exception}")
-            return
-            
-        # 추론 결과 추출 및 타임스탬프 기록
-        t_end = time.perf_counter()
-        t_start = bindings.context # 바인딩 시 저장했던 시작 시간
-        frame_id = bindings.frame_id
-        
-        e2e_lat = (t_end - t_start) * 1000.0
-        self.log_queue.put((frame_id, e2e_lat))
-
     def run_benchmark(self, video_path, max_frames=2000):
         cap = cv2.VideoCapture(os.path.abspath(video_path))
         monitor = SystemMonitor()
         monitor.start()
-
-        # 결과를 담을 버퍼
         results = []
         
         print(f"[INFO] Starting 4.23.0 Async Benchmark...")
         
-        with self.infer_model.activate():
+        with self.infer_model.configure() as configured_infer_model:
             start_time_total = time.time()
-            
+
+            ongoing_bindings = []
             for i in range(max_frames):
                 ret, frame = cap.read()
                 if not ret: break
@@ -293,16 +278,30 @@ class HailoAsyncBenchmark:
                 input_data = np.expand_dims(resized, axis=0)
 
                 # 2. 비동기 추론 요청 (Bindings 사용)
-                bindings = self.infer_model.create_bindings()
+                bindings = configured_infer_model.create_bindings()
                 bindings.input(self.input_name).set_buffer(input_data)
-                
-                # 메타데이터 전달 (시작 시간과 프레임 ID)
-                bindings.context = t_start 
-                bindings.frame_id = i
-                
-                # 비동기 실행 (Non-blocking)
-                self.infer_model.run([bindings], self.callback)
 
+                def get_callback(f_id, t_st, current_binding):
+                    def cb(completion_info):
+                        # 1. 에러 체크
+                        if completion_info.exception:
+                            print(f"[ERROR] Inference failed: {completion_info.exception}")
+                        else:
+                            # 2. 레이턴시 계산 및 저장
+                            t_end = time.perf_counter()
+                            e2e_lat = (t_end - t_st) * 1000.0
+                            self.log_queue.put((f_id, e2e_lat))
+                        
+                        # 3. 처리가 끝난 메모리 해제
+                        if current_binding in ongoing_bindings:
+                            ongoing_bindings.remove(current_binding)
+                    return cb
+
+                # GC 방지 리스트에 추가
+                ongoing_bindings.append(bindings)
+
+                # 비동기 실행 (Non-blocking)
+                configured_infer_model.run_async([bindings], get_callback(i, t_start, bindings))
                 # 로그 큐에서 데이터 가끔 비워주기 (메모리 관리)
                 while not self.log_queue.empty():
                     results.append(self.log_queue.get())
@@ -314,6 +313,10 @@ class HailoAsyncBenchmark:
         # 종료 및 로깅
         monitor.stop()
         cap.release()
+
+        while not self.log_queue.empty():
+            results.append(self.log_queue.get())
+
         self._save_logs(results, total_duration, monitor.stats)
 
     def _save_logs(self, results, duration, stats):
