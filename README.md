@@ -272,7 +272,23 @@ class HailoAsyncBenchmark:
         with self.infer_model.configure() as configured_infer_model:
             start_time_total = time.time()
 
-            ongoing_bindings = []
+            POOL_SIZE = 10  # 동시에 유지할 최대 비동기 파이프라인 개수
+            buffer_pool = queue.Queue(maxsize=POOL_SIZE)
+
+            for _ in range(POOL_SIZE):
+                bindings = configured_infer_model.create_bindings()
+                input_buf = np.empty(self.input_shape, dtype=np.uint8)
+                bindings.input(self.input_name).set_buffer(input_buf)
+                output_bufs = {}
+                for out_info in self.output_info:
+                    out_buf = np.empty(out_info["shape"], dtype=np.float32)
+                    bindings.output(out_info["name"]).set_buffer(out_buf)
+                    output_bufs[out_info["name"]] = out_buf
+
+                buffer_pool.put((bindings, input_buf, output_bufs))
+
+            print(f"[INFO] Allocated {POOL_SIZE} buffer sets. Measurement Started!")
+
             for i in range(max_frames):
                 ret, frame = cap.read()
                 if not ret: break
@@ -282,16 +298,8 @@ class HailoAsyncBenchmark:
                 resized = cv2.resize(frame, (self.in_w, self.in_h))
                 input_data = np.expand_dims(resized, axis=0)
 
-                # 2. 비동기 추론 요청 (Bindings 사용)
-                bindings = configured_infer_model.create_bindings()
-                bindings.input(self.input_name).set_buffer(input_data)
-
-                output_buffers = {}
-                for out_info in self.output_info:
-                    # NPU가 값을 채워넣을 빈 FLOAT32 배열 할당
-                    empty_buffer = np.empty(out_info["shape"], dtype=np.float32)
-                    bindings.output(out_info["name"]).set_buffer(empty_buffer)
-                    output_buffers[out_info["name"]] = empty_buffer
+                bindings, input_buf, output_bufs = buffer_pool.get()
+                np.copyto(input_buf, input_data)
 
                 def get_callback(f_id, t_st, current_binding, out_bufs):
                     def cb(completion_info):
@@ -301,24 +309,18 @@ class HailoAsyncBenchmark:
                             t_end = time.perf_counter()
                             e2e_lat = (t_end - t_st) * 1000.0
                             self.log_queue.put((f_id, e2e_lat))
-                        
-                        if current_binding in ongoing_bindings:
-                            ongoing_bindings.remove(current_binding)
+                        buffer_pool.put((current_binding, curr_in, curr_outs))
                     return cb
 
-                # GC 방지 리스트에 추가
-                ongoing_bindings.append(bindings)
-
-                # 비동기 실행 (Non-blocking)
-                job = configured_infer_model.run_async([bindings], get_callback(i, t_start, bindings, output_buffers))
+                # 비동기 실행
+                configured_infer_model.run_async([bindings], get_callback(i, t_start, bindings, input_buf, output_bufs))
 
                 # 로그 큐에서 데이터 비워주기 (메모리 관리)
                 while not self.log_queue.empty():
                     results.append(self.log_queue.get())
 
             # 모든 작업 완료 대기
-            if 'job' in locals():
-                job.wait(10000)
+            configured_infer_model.wait_for_async_tasks() 
             total_duration = time.time() - start_time_total
 
         # 종료 및 로깅
