@@ -143,7 +143,7 @@ def run_final_benchmark_rpi(model_path, video_path):
                         t_infer_end = time.perf_counter()
 
                         # 3. CPU Postprocessing (Minimal)
-                        det_out, da_out, ll_out = output.values()
+                        _ = list(output.values())
 
                         # [D] E2E 종료 시간 측정
                         t_e2e_end = time.perf_counter()
