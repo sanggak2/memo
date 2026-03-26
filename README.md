@@ -539,20 +539,349 @@ if __name__ == "__main__":
     bench = HailoAsyncBenchmark(args.model)
     bench.run_benchmark(args.video)
 ```
+visualize
+```
+import cv2
+import numpy as np
+import os
+import json
+from hailo_platform import (
+    HEF, VDevice, HailoStreamInterface, ConfigureParams,
+    InputVStreamParams, OutputVStreamParams,
+    FormatType, InferVStreams
+)
+
+# =====================================================
+# 0. 설정 및 상수 (YOLOP 객체 탐지용)
+# =====================================================
+LOG_DIR = "debug_logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# YOLOP Anchor 설정 (Stride 8, 16, 32)
+ANCHORS = [
+    [[3, 9], [5, 11], [4, 20]],       # Stride 8
+    [[7, 18], [6, 39], [12, 31]],     # Stride 16
+    [[19, 50], [38, 81], [68, 157]]   # Stride 32
+]
+STRIDES = [8, 16, 32]
+
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
+def save_array_stats(name, arr):
+    stats = {
+        "shape": arr.shape,
+        "dtype": str(arr.dtype),
+        "min": float(arr.min()),
+        "max": float(arr.max()),
+        "mean": float(arr.mean()),
+        "std": float(arr.std()),
+    }
+    with open(f"{LOG_DIR}/{name}_stats.json", "w") as f:
+        json.dump(stats, f, indent=2)
+
+# =====================================================
+# 1. 전처리 함수 (Letterbox)
+# =====================================================
+def letterbox(img, new_shape=(384, 640), color=(114,114,114)):
+    h, w = img.shape[:2]
+    nh, nw = new_shape
+    r = min(nh / h, nw / w)
+    new_unpad = (int(w * r), int(h * r))
+    resized = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+    dw = nw - new_unpad[0]
+    dh = nh - new_unpad[1]
+    dw //= 2
+    dh //= 2
+    padded = cv2.copyMakeBorder(
+        resized,
+        dh, nh - new_unpad[1] - dh,
+        dw, nw - new_unpad[0] - dw,
+        cv2.BORDER_CONSTANT,
+        value=color
+    )
+    return padded, r, (dw, dh)
+
+# =====================================================
+# 2. 객체 탐지 후처리 (Decoding)
+# =====================================================
+def decode_detections(det_outputs, conf_thres=0.25):
+    boxes = []
+    scores = []
+    class_ids = []
+
+    # Hailo 출력은 보통 (1, H, W, Channels) 형태입니다. (NHWC)
+    # det_outputs 순서: [det_8, det_16, det_32]
+    
+    for i, pred in enumerate(det_outputs):
+        stride = STRIDES[i]
+        anchor = np.array(ANCHORS[i]) # (3, 2)
+        
+        # pred shape 예시: (1, 48, 80, 18) -> Stride 8일 때 (384/8=48, 640/8=80)
+        bs, h, w, ch = pred.shape
+        
+        # Reshape: (Batch, H, W, 3, 6) -> Anchor 3개, 정보 6개(x,y,w,h,conf,cls)
+        pred = pred.reshape(bs, h, w, 3, 6)
+        
+        # Sigmoid 적용 (0~1 범위로 변환)
+        pred = sigmoid(pred)
+        
+        # Grid 생성
+        grid_x, grid_y = np.meshgrid(np.arange(w), np.arange(h)) # (H, W)
+        # (H, W, 1) 형태로 변환 후 Stack -> (H, W, 2)
+        grid = np.stack((grid_x, grid_y), axis=2)
+        # Broadcasting을 위해 차원 확장: (1, H, W, 1, 2)
+        grid = grid.reshape(1, h, w, 1, 2)
+
+        # 좌표 복원
+        # xy = (pred[..., 0:2] * 2 - 0.5 + grid) * stride
+        # wh = (pred[..., 2:4] * 2) ** 2 * anchor
+        
+        pred_xy = (pred[..., 0:2] * 2.0 - 0.5 + grid) * stride
+        
+        # Anchor Broadcasting: (1, 1, 1, 3, 2)
+        anchor_broadcast = anchor.reshape(1, 1, 1, 3, 2)
+        pred_wh = (pred[..., 2:4] * 2.0) ** 2 * anchor_broadcast
+        
+        pred_conf = pred[..., 4] # Objectness
+        pred_cls = pred[..., 5]  # Class score
+        
+        # Final Score
+        final_score = pred_conf * pred_cls
+        
+        # Threshold Filtering
+        mask = final_score > conf_thres
+        
+        if not np.any(mask):
+            continue
+            
+        valid_xy = pred_xy[mask]
+        valid_wh = pred_wh[mask]
+        valid_scores = final_score[mask]
+        
+        # (cx, cy, w, h) -> (x1, y1, w, h) 좌상단 변환
+        x1y1 = valid_xy - valid_wh / 2
+        valid_boxes = np.concatenate([x1y1, valid_wh], axis=1)
+        
+        boxes.extend(valid_boxes.tolist())
+        scores.extend(valid_scores.tolist())
+        class_ids.extend([0] * len(valid_scores))
+        
+    return boxes, scores, class_ids
+
+# =====================================================
+# 3. Main App
+# =====================================================
+class YoloPFullApp:
+    def __init__(self, hef_path):
+        print("[Init] Loading HEF...")
+        self.hef = HEF(hef_path)
+        self.device = VDevice()
+
+        params = ConfigureParams.create_from_hef(
+            hef=self.hef,
+            interface=HailoStreamInterface.PCIe
+        )
+        self.network_group = self.device.configure(self.hef, params)[0]
+
+        self.input_vstream_params = InputVStreamParams.make(
+            self.network_group,
+            format_type=FormatType.UINT8
+        )
+        self.output_vstream_params = OutputVStreamParams.make(
+            self.network_group,
+            format_type=FormatType.FLOAT32 # 후처리를 위해 Float32로 받음
+        )
+
+        input_info = self.hef.get_input_vstream_infos()[0]
+        self.input_name = input_info.name
+        self.in_h, self.in_w, _ = input_info.shape
+
+        print(f"[Init] Input Name: {self.input_name}")
+        print(f"[Init] Input Shape: {input_info.shape}")
+
+    def run(self, video_path, output_path="output_result.mp4"):
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError("Video Open Failed")
+
+        w0 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h0 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+
+        out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w0, h0))
+
+        print("[Run] Start Inference...")
+
+        with self.network_group.activate():
+            with InferVStreams(self.network_group, self.input_vstream_params, self.output_vstream_params) as pipe:
+                frame_idx = 0
+                while True:
+                    ret, frame = cap.read()
+                    if not ret: break
+                    frame_idx += 1
+
+                    # 1. Preprocess
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    img, r, (dw, dh) = letterbox(rgb, (self.in_h, self.in_w))
+                    inp = np.expand_dims(img, axis=0).astype(np.uint8)
+
+                    # 2. Inference
+                    outputs = pipe.infer({self.input_name: inp})
+
+                    # 3. Get Outputs (5 Tensors)
+                    # HEF 변환 시 지정한 이름대로 가져옵니다.
+                    try:
+                        det_8 = outputs['model/conv57']
+                        det_16 = outputs['model/conv65']
+                        det_32 = outputs['model/conv72']
+                        da_seg = outputs['model/ne_activation_activation1']
+                        ll_seg = outputs['model/ne_activation_activation2']
+                    except KeyError:
+                        print("[Error] Output keys mismatch. Check HEF export names.")
+                        print("Keys found:", outputs.keys())
+                        break
+
+                    # =================================================
+                    # 4-1. Postprocess: Drivable Area & Lane Line
+                    # =================================================
+                    da = da_seg[0] # (H, W, 2)
+                    ll = ll_seg[0] # (H, W, 2)
+
+                    # Drive Area: Background vs Drivable
+                    # 기존 로직: diff = drivable - background
+                    da_diff = da[..., 1] - da[..., 0]
+                    da_mask = np.zeros_like(da_diff, dtype=np.uint8)
+                    
+                    # 간단한 임계값 적용 (복잡한 column-wise 대신 속도 최적화)
+                    # 필요시 기존 column 로직으로 교체 가능
+                    da_mask[da_diff > 0.0] = 1 
+
+                    # Lane Line: Argmax
+                    ll_mask = np.argmax(ll, axis=-1).astype(np.uint8)
+
+                    # Crop Padding (Letterbox 복원)
+                    if dh > 0:
+                        da_mask = da_mask[dh:-dh, :]
+                        ll_mask = ll_mask[dh:-dh, :]
+                    if dw > 0:
+                        da_mask = da_mask[:, dw:-dw]
+                        ll_mask = ll_mask[:, dw:-dw]
+
+                    # Resize to Original
+                    da_mask = cv2.resize(da_mask, (w0, h0), interpolation=cv2.INTER_NEAREST)
+                    ll_mask = cv2.resize(ll_mask, (w0, h0), interpolation=cv2.INTER_NEAREST)
+
+                    # =================================================
+                    # 4-2. Postprocess: Object Detection
+                    # =================================================
+                    boxes, scores, class_ids = decode_detections([det_8, det_16, det_32], conf_thres=0.4)
+                    
+                    # 스케일 복원 (Original Image 좌표로 변환)
+                    # Letterbox 좌표 (img) -> 원본 좌표 (frame)
+                    # x_original = (x_pad - dw) / r
+                    # y_original = (y_pad - dh) / r
+                    
+                    final_boxes = []
+                    for b in boxes:
+                        x1, y1, w, h = b
+                        
+                        # Padding 제거
+                        x1 = (x1 - dw) / r
+                        y1 = (y1 - dh) / r
+                        w = w / r
+                        h = h / r
+                        
+                        final_boxes.append([int(x1), int(y1), int(w), int(h)])
+
+                    # NMS (Non-Maximum Suppression)
+                    indices = cv2.dnn.NMSBoxes(final_boxes, scores, score_threshold=0.4, nms_threshold=0.45)
+
+                    # =================================================
+                    # 5. Visualization
+                    # =================================================
+                    overlay = frame.copy()
+                    
+                    # 1) 주행 영역 (초록색)
+                    overlay[da_mask == 1] = (0, 255, 0)
+                    
+                    # 2) 차선 영역 (빨간색)
+                    overlay[ll_mask == 1] = (0, 0, 255)
+                    
+                    # 합성
+                    result = cv2.addWeighted(frame, 0.7, overlay, 0.3, 0)
+                    
+                    # 3) 객체 박스 그리기 (파란색)
+                    if len(indices) > 0:
+                        for i in indices.flatten():
+                            bx, by, bw, bh = final_boxes[i]
+                            cv2.rectangle(result, (bx, by), (bx+bw, by+bh), (255, 0, 0), 2)
+                            cv2.putText(result, f"{scores[i]:.2f}", (bx, by-5), 
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+                    out.write(result)
+                    if frame_idx % 30 == 0:
+                        print(f"Processing frame {frame_idx}...", end="\r")
+
+        cap.release()
+        out.release()
+        print(f"\n[Done] Result saved to {output_path}")
+
+if __name__ == "__main__":
+    app = YoloPFullApp("yolop_raw.hef")
+    app.run("Video.mp4", "final_output.mp4")
+```
 
 Error
 ```
-[INIT] Model has 1 input and 5 outputs.
-[INFO] Starting 4.23.0 Async Benchmark...
-[INFO] Allocated 10 buffer sets. Measurement Started!
-[ERROR] Inference failed: Stream was aborted
-[ERROR] Inference failed: Stream was aborted
+[Init] Loading HEF...
+[Init] Input Name: model/input_layer1
+[Init] Input Shape: (384, 640, 3)
+[Run] Start Inference...
+[HailoRT] [error] CHECK failed - UserBuffQEl2model/conv72 (D2H) failed with status=HAILO_TIMEOUT(4) (timeout=10000ms)
+[HailoRT] [error] CHECK failed - UserBuffQEl0model/ne_activation_activation2 (D2H) failed with status=HAILO_TIMEOUT(4) (timeout=10000ms)
+[HailoRT] [error] CHECK failed - UserBuffQEl3model/ne_activation_activation1 (D2H) failed with status=HAILO_TIMEOUT(4) (timeout=10000ms)
+[HailoRT] [error] CHECK failed - UserBuffQEl1model/conv65 (D2H) failed with status=HAILO_TIMEOUT(4) (timeout=10000ms)
+[HailoRT] [error] CHECK failed - UserBuffQEl3model/conv57 (D2H) failed with status=HAILO_TIMEOUT(4) (timeout=10000ms)
+[HailoRT] [error] Failed waiting for threads with status HAILO_TIMEOUT(4)
+[HailoRT] [error] Failed waiting for threads with status HAILO_TIMEOUT(4)
+[HailoRT] [error] Failed waiting for threads with status HAILO_TIMEOUT(4)
+[HailoRT] [error] Failed waiting for threads with status HAILO_TIMEOUT(4)
+[HailoRT] [error] Failed waiting for threads with status HAILO_TIMEOUT(4)
+[HailoRT] [error] Ioctl HAILO_FW_CONTROL failed with 19. Read dmesg log for more info
+[HailoRT] [error] CHECK_SUCCESS failed with status=HAILO_DRIVER_OPERATION_FAILED(36) - Failed in fw_control
+[HailoRT] [error] CHECK_SUCCESS failed with status=HAILO_DRIVER_OPERATION_FAILED(36) - Failed to send fw control
+[HailoRT] [error] CHECK_SUCCESS failed with status=HAILO_DRIVER_OPERATION_FAILED(36)
+[HailoRT] [error] CHECK_SUCCESS failed with status=HAILO_DRIVER_OPERATION_FAILED(36)
+[HailoRT] [error] CHECK_SUCCESS failed with status=HAILO_DRIVER_OPERATION_FAILED(36) - Failed to reset context switch state machine
+[HailoRT] [error] Failed deactivating core-op (status HAILO_DRIVER_OPERATION_FAILED(36))
+[HailoRT] [error] Failed to deactivate low level streams with HAILO_DRIVER_OPERATION_FAILED(36)
+[HailoRT] [error] Failed deactivating core-op (status HAILO_DRIVER_OPERATION_FAILED(36))
+[HailoRT] [error] Failed deactivate HAILO_DRIVER_OPERATION_FAILED(36)
 Traceback (most recent call last):
-  File "/workspace/async-benchmark.py", line 151, in <module>
-    bench.run_benchmark(args.video)
-  File "/workspace/async-benchmark.py", line 128, in run_benchmark
-    configured_infer_model.wait_for_async_tasks() 
-AttributeError: 'ConfiguredInferModel' object has no attribute 'wait_for_async_tasks'. Did you mean: 'wait_for_async_ready'?
+  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 974, in infer
+    self._infer_pipeline.infer(input_data, output_buffers, batch_size)
+hailo_platform.pyhailort._pyhailort.HailoRTStatusException: 4
 
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/workspace/visualize.py", line 289, in <module>
+    app.run("Video.mp4", "final_output.mp4")
+  File "/workspace/visualize.py", line 187, in run
+    outputs = pipe.infer({self.input_name: inp})
+  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 972, in infer
+    with ExceptionWrapper():
+  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 122, in __exit__
+    self._raise_indicative_status_exception(value)
+  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 172, in _raise_indicative_status_exception
+    raise self.create_exception_from_status(error_code) from libhailort_exception
+hailo_platform.pyhailort.pyhailort.HailoRTTimeout: Received a timeout - hailort has failed because a timeout had occurred
+[HailoRT] [error] Ioctl HAILO_FW_CONTROL failed with 19. Read dmesg log for more info
+[HailoRT] [error] CHECK_SUCCESS failed with status=HAILO_DRIVER_OPERATION_FAILED(36) - Failed in fw_control
+[HailoRT] [error] CHECK_SUCCESS failed with status=HAILO_DRIVER_OPERATION_FAILED(36) - Failed to send fw control
+[HailoRT] [error] CHECK_SUCCESS failed with status=HAILO_DRIVER_OPERATION_FAILED(36)
+[HailoRT] [error] CHECK_SUCCESS failed with status=HAILO_DRIVER_OPERATION_FAILED(36)
+[HailoRT] [warning] clear configured apps ended with status HAILO_DRIVER_OPERATION_FAILED(36)
 
 ```
