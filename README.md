@@ -80,11 +80,8 @@ def run_final_benchmark_rpi(model_path, video_path):
       hef = HEF(model_path)
       configure_params = ConfigureParams.create_from_hef(hef=hef, interface=HailoStreamInterface.PCIe)
       network_groups = target.configure(hef, configure_params)
-
-    configure_params = ConfigureParams.create_from_hef(hef=hef, interface=HailoStreamInterface.PCIe)
-    network_groups = target.configure(hef, configure_params)
-    network_group = network_
-    roups[0]
+      network_group = network_
+      roups[0]
 
     input_vstream_params = InputVStreamParams.make(network_group, format_type=FormatType.UINT8)
     output_vstream_params = OutputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
