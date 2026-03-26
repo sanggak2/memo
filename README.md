@@ -16,6 +16,7 @@ cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 ```
 t
 ```
+Frame_ID,Unix_Time,Timestamp,System_FPS,Infer_Latency_ms,E2E_Latency_ms,CPU_Usage_Percent,Temp_C
 
 동기식
 ```
