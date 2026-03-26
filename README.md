@@ -76,12 +76,15 @@ def run_final_benchmark_rpi(model_path, video_path):
 
     # Hailo Init
     print("[INIT] Loading Hailo HEF...")
-    target = VDevice()
-    hef = HEF(model_path)
+    with VDevice() as target:
+      hef = HEF(model_path)
+      configure_params = ConfigureParams.create_from_hef(hef=hef, interface=HailoStreamInterface.PCIe)
+      network_groups = target.configure(hef, configure_params)
 
     configure_params = ConfigureParams.create_from_hef(hef=hef, interface=HailoStreamInterface.PCIe)
     network_groups = target.configure(hef, configure_params)
-    network_group = network_groups[0]
+    network_group = network_
+    roups[0]
 
     input_vstream_params = InputVStreamParams.make(network_group, format_type=FormatType.UINT8)
     output_vstream_params = OutputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
@@ -144,7 +147,7 @@ def run_final_benchmark_rpi(model_path, video_path):
                     t_infer_end = time.perf_counter()
 
                     # 3. CPU Postprocessing (Minimal)
-                    _ = list(output.values())[0]
+                    det_out, da_out, ll_out = output.values()
 
                     # [D] E2E 종료 시간 측정
                     t_e2e_end = time.perf_counter()
