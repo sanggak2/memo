@@ -473,14 +473,17 @@ class HailoAsyncBenchmark:
                 bindings, input_buf, output_bufs = buffer_pool.get()
                 np.copyto(input_buf, input_data)
 
-                def get_callback(f_id, t_st, current_binding, curr_in, curr_outs):
+                def get_callback(f_id, t_nw, t_e2e_st, t_inf_st, current_binding, curr_in, curr_outs, c_cpu, c_tmp):
                     def cb(completion_info):
                         if completion_info.exception:
                             print(f"[ERROR] Inference failed: {completion_info.exception}")
                         else:
                             t_end = time.perf_counter()
-                            e2e_lat = (t_end - t_st) * 1000.0
-                            self.log_queue.put((f_id, e2e_lat))
+                            infer_latency = (t_end - t_inf_st) * 1000.0
+                            e2e_latency = (t_end - t_inf_st) * 1000.0
+                            fps = 1000.0 / e2e_latency if e2e_latency > 0 else 0
+
+                            self.log_queue.put((f_id, t_nw, fps, infer_latency, e2e_latency, c_cpu, c_tmp))
                         buffer_pool.put((current_binding, curr_in, curr_outs))
                     return cb
 
