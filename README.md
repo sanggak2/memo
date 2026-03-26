@@ -193,16 +193,16 @@ def run_final_benchmark_rpi(model_path, video_path):
             print(f"[RESULT] Avg System FPS: {frame_id / total_dur:.2f}")
             print(f"[RESULT] Saved to {log_path}")
 
-    if __name__ == "__main__":
-        parser = argparse.ArgumentParser()
-        parser.add_argument('--model', default='yolop_raw.hef', help='Path to .hef model') 
-        parser.add_argument('--video', default='NonDureong.mp4', help='Input video')
-        args = parser.parse_args()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', default='yolop_raw.hef', help='Path to .hef model') 
+    parser.add_argument('--video', default='NonDureong.mp4', help='Input video')
+    args = parser.parse_args()
 
-        if os.path.exists(args.model) and os.path.exists(args.video):
-            run_final_benchmark_rpi(args.model, args.video)
-        else:
-            print("[ERROR] File not found.")
+    if os.path.exists(args.model) and os.path.exists(args.video):
+        run_final_benchmark_rpi(args.model, args.video)
+    else:
+        print("[ERROR] File not found.")
 ```
 
 비동기식
