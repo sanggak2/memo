@@ -834,15 +834,15 @@ if __name__ == "__main__":
 
 Error
 ```
-[Init] Loading HEF...
-[Init] Input Name: model/input_layer1
-[Init] Input Shape: (384, 640, 3)
-[Run] Start Inference...
+[WARN] 우선순위 설정 실패: [Errno 1] Operation not permitted
+[INIT] Loading Hailo HEF...
+[INIT] Model Input Shape: 384x640
+[INFO] 🚀 FINAL RPi+Hailo Benchmark Started (Dual Latency Mode)
 [HailoRT] [error] CHECK failed - UserBuffQEl2model/conv72 (D2H) failed with status=HAILO_TIMEOUT(4) (timeout=10000ms)
-[HailoRT] [error] CHECK failed - UserBuffQEl0model/ne_activation_activation2 (D2H) failed with status=HAILO_TIMEOUT(4) (timeout=10000ms)
-[HailoRT] [error] CHECK failed - UserBuffQEl3model/ne_activation_activation1 (D2H) failed with status=HAILO_TIMEOUT(4) (timeout=10000ms)
 [HailoRT] [error] CHECK failed - UserBuffQEl1model/conv65 (D2H) failed with status=HAILO_TIMEOUT(4) (timeout=10000ms)
+[HailoRT] [error] CHECK failed - UserBuffQEl3model/ne_activation_activation1 (D2H) failed with status=HAILO_TIMEOUT(4) (timeout=10000ms)
 [HailoRT] [error] CHECK failed - UserBuffQEl3model/conv57 (D2H) failed with status=HAILO_TIMEOUT(4) (timeout=10000ms)
+[HailoRT] [error] CHECK failed - UserBuffQEl0model/ne_activation_activation2 (D2H) failed with status=HAILO_TIMEOUT(4) (timeout=10000ms)
 [HailoRT] [error] Failed waiting for threads with status HAILO_TIMEOUT(4)
 [HailoRT] [error] Failed waiting for threads with status HAILO_TIMEOUT(4)
 [HailoRT] [error] Failed waiting for threads with status HAILO_TIMEOUT(4)
@@ -858,30 +858,19 @@ Error
 [HailoRT] [error] Failed to deactivate low level streams with HAILO_DRIVER_OPERATION_FAILED(36)
 [HailoRT] [error] Failed deactivating core-op (status HAILO_DRIVER_OPERATION_FAILED(36))
 [HailoRT] [error] Failed deactivate HAILO_DRIVER_OPERATION_FAILED(36)
-Traceback (most recent call last):
-  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 974, in infer
-    self._infer_pipeline.infer(input_data, output_buffers, batch_size)
-hailo_platform.pyhailort._pyhailort.HailoRTStatusException: 4
-
-The above exception was the direct cause of the following exception:
-
-Traceback (most recent call last):
-  File "/workspace/visualize.py", line 289, in <module>
-    app.run("Video.mp4", "final_output.mp4")
-  File "/workspace/visualize.py", line 187, in run
-    outputs = pipe.infer({self.input_name: inp})
-  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 972, in infer
-    with ExceptionWrapper():
-  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 122, in __exit__
-    self._raise_indicative_status_exception(value)
-  File "/usr/local/lib/python3.10/dist-packages/hailo_platform/pyhailort/pyhailort.py", line 172, in _raise_indicative_status_exception
-    raise self.create_exception_from_status(error_code) from libhailort_exception
-hailo_platform.pyhailort.pyhailort.HailoRTTimeout: Received a timeout - hailort has failed because a timeout had occurred
+[ERROR] Received a timeout - hailort has failed because a timeout had occurred
 [HailoRT] [error] Ioctl HAILO_FW_CONTROL failed with 19. Read dmesg log for more info
 [HailoRT] [error] CHECK_SUCCESS failed with status=HAILO_DRIVER_OPERATION_FAILED(36) - Failed in fw_control
 [HailoRT] [error] CHECK_SUCCESS failed with status=HAILO_DRIVER_OPERATION_FAILED(36) - Failed to send fw control
 [HailoRT] [error] CHECK_SUCCESS failed with status=HAILO_DRIVER_OPERATION_FAILED(36)
 [HailoRT] [error] CHECK_SUCCESS failed with status=HAILO_DRIVER_OPERATION_FAILED(36)
 [HailoRT] [warning] clear configured apps ended with status HAILO_DRIVER_OPERATION_FAILED(36)
+Traceback (most recent call last):
+  File "/workspace/benchmark.py", line 182, in <module>
+    run_final_benchmark_rpi(args.model, args.video)
+  File "/workspace/benchmark.py", line 155, in run_final_benchmark_rpi
+    total_dur = time.time() - start_time_global
+UnboundLocalError: local variable 'start_time_global' referenced before assignment
+
 
 ```
