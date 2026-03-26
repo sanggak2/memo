@@ -378,7 +378,7 @@ from datetime import datetime
 from hailo_platform import VDevice, FormatType, HailoSchedulingAlgorithm
 
 # -------------------------------------------------
-# 1. System Monitor
+# 1. System Monitor (기존 유지)
 # -------------------------------------------------
 class SystemMonitor(threading.Thread):
     def __init__(self, interval=0.5):
@@ -399,7 +399,7 @@ class SystemMonitor(threading.Thread):
     def stop(self): self.running = False
 
 # -------------------------------------------------
-# 2. Benchmark Class (HailoRT 4.23.0 Async)
+# 2. Benchmark Class (HailoRT 4.23.0 전용)
 # -------------------------------------------------
 class HailoAsyncBenchmark:
     def __init__(self, model_path):
@@ -465,65 +465,45 @@ class HailoAsyncBenchmark:
                 ret, frame = cap.read()
                 if not ret: break
 
-                # [A] E2E 시작 시간 및 시스템 메트릭 기록
-                t_now = time.time()
-                t_e2e_start = time.perf_counter()
-                cpu_usage = monitor.stats["cpu"]
-                temp_c = monitor.stats["temp"]
-
-                # 1. 전처리 (BGR -> RGB 추가)
+                # 1. 전처리
+                t_start = time.perf_counter()
                 resized = cv2.resize(frame, (self.in_w, self.in_h))
-                rgb_frame = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-                input_data = np.expand_dims(rgb_frame, axis=0)
+                input_data = np.expand_dims(resized, axis=0)
 
                 bindings, input_buf, output_bufs = buffer_pool.get()
                 np.copyto(input_buf, input_data)
 
-                # [B] Inference 시작 시간 (NPU 전송 직전)
-                t_infer_start = time.perf_counter()
-
-                # 콜백 함수 정의: 콜백 내부에서 종료 시간을 측정하고 큐에 데이터 저장
-                def get_callback(f_id, t_nw, t_e2e_st, t_inf_st, current_binding, curr_in, curr_outs, c_cpu, c_tmp):
+                def get_callback(f_id, t_st, current_binding, curr_in, curr_outs):
                     def cb(completion_info):
                         if completion_info.exception:
                             print(f"[ERROR] Inference failed: {completion_info.exception}")
                         else:
                             t_end = time.perf_counter()
-                            infer_latency = (t_end - t_inf_st) * 1000.0
-                            e2e_latency = (t_end - t_e2e_st) * 1000.0
-                            fps = 1000.0 / e2e_latency if e2e_latency > 0 else 0
-                            
-                            # CSV에 쓸 7가지 데이터를 튜플로 전달
-                            self.log_queue.put((f_id, t_nw, fps, infer_latency, e2e_latency, c_cpu, c_tmp))
-                            
-                            if f_id % 200 == 0:
-                                print(f"[{f_id}] Async Infer: {infer_latency:.2f}ms | E2E: {e2e_latency:.2f}ms")
-                                
+                            e2e_lat = (t_end - t_st) * 1000.0
+                            self.log_queue.put((f_id, e2e_lat))
                         buffer_pool.put((current_binding, curr_in, curr_outs))
                     return cb
 
                 # 비동기 실행
-                job = configured_infer_model.run_async([bindings], get_callback(i, t_now, t_e2e_start, t_infer_start, bindings, input_buf, output_bufs, cpu_usage, temp_c))
+                job = configured_infer_model.run_async([bindings], get_callback(i, t_start, bindings, input_buf, output_bufs))
 
-                # 메인 루프에서 큐가 너무 쌓이지 않도록 주기적으로 비워줌
+                # 로그 큐에서 데이터 비워주기 (메모리 관리)
                 while not self.log_queue.empty():
                     results.append(self.log_queue.get())
 
             # 모든 작업 완료 대기
-            print("[INFO] Waiting for all async jobs to finish...")
             for _ in range(POOL_SIZE):
-                buffer_pool.get() 
-                
+                buffer_pool.get()
             total_duration = time.time() - start_time_total
 
-        # 종료 및 남은 로그 수집
+        # 종료 및 로깅
         monitor.stop()
         cap.release()
 
         while not self.log_queue.empty():
             results.append(self.log_queue.get())
 
-        self._save_logs(results, total_duration)
+        self._save_logs(results, total_duration, monitor.stats)
 
     def _save_logs(self, results, duration):
         # 1. 비동기 콜백은 완료 순서가 뒤바뀔 수 있으므로 Frame_ID(x[0]) 기준으로 오름차순 정렬
@@ -542,7 +522,7 @@ class HailoAsyncBenchmark:
                 fid, ts, fps, inf_lat, e2e_lat, cpu, tmp = row
                 ts_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S.%f")
                 writer.writerow([fid, f"{ts:.6f}", ts_str, f"{fps:.2f}", f"{inf_lat:.2f}", f"{e2e_lat:.2f}", cpu, tmp])
-                
+
         avg_fps = len(results) / duration
         print(f"\n[RESULT] Avg Throughput: {avg_fps:.2f} FPS")
         print(f"[RESULT] Saved to {log_path}")
