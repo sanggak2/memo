@@ -206,6 +206,22 @@ def run_final_benchmark_rpi(model_path, video_path):
                             det_outs.sort(key=lambda x: x.shape[1], reverse=True) 
                             det_8, det_16, det_32 = det_outs[0], det_outs[1], det_outs[2]
                             da_seg, ll_seg = seg_outs[0], seg_outs[1]
+                        
+                        if len(det_8.shape) == 3:
+                            det_8 = np.expand_dims(det_8, axis=0)
+                            det_16 = np.expand_dims(det_16, axis=0)
+                            det_32 = np.expand_dims(det_32, axis=0)
+                            da_seg = np.expand_dims(da_seg, axis=0)
+                            ll_seg = np.expand_dims(ll_seg, axis=0)
+
+                            # 3) NCHW 포맷일 경우 NHWC 포맷으로 변환
+                        if len(det_8.shape) == 4 and det_8.shape[1] == 18: 
+                            det_8 = np.transpose(det_8, (0, 2, 3, 1))
+                            det_16 = np.transpose(det_16, (0, 2, 3, 1))
+                            det_32 = np.transpose(det_32, (0, 2, 3, 1))
+                        if len(da_seg.shape) == 4 and da_seg.shape[1] == 2:
+                            da_seg = np.transpose(da_seg, (0, 2, 3, 1))
+                            ll_seg = np.transpose(ll_seg, (0, 2, 3, 1))
 
                         # 3-1. Drivable & Lane Line Mask 처리
                         da_diff = da_seg[0][..., 1] - da_seg[0][..., 0]
