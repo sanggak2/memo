@@ -293,7 +293,7 @@ import time
 import argparse
 import os
 import cv2
-cv2.setNumThreads(1)
+cv2.setNumThreads(1) # OpenCV가 스레드를 과도하게 생성하여 GIL과 충돌하는 것 방지
 import numpy as np
 import psutil
 import csv
@@ -303,7 +303,55 @@ from datetime import datetime
 from hailo_platform import VDevice, FormatType, HailoSchedulingAlgorithm
 
 # -------------------------------------------------
-# 1. System Monitor (기존 유지)
+# 0. YOLOP Post-Processing Constants & Utils
+# -------------------------------------------------
+ANCHORS = [
+    [[3, 9], [5, 11], [4, 20]],       # Stride 8
+    [[7, 18], [6, 39], [12, 31]],     # Stride 16
+    [[19, 50], [38, 81], [68, 157]]   # Stride 32
+]
+STRIDES = [8, 16, 32]
+
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
+def decode_detections(det_outputs, conf_thres=0.4):
+    boxes, scores, class_ids = [], [], []
+    for i, pred in enumerate(det_outputs):
+        stride = STRIDES[i]
+        anchor = np.array(ANCHORS[i])
+        bs, h, w, ch = pred.shape
+        pred = pred.reshape(bs, h, w, 3, 6)
+        pred = sigmoid(pred)
+        
+        grid_x, grid_y = np.meshgrid(np.arange(w), np.arange(h))
+        grid = np.stack((grid_x, grid_y), axis=2).reshape(1, h, w, 1, 2)
+
+        pred_xy = (pred[..., 0:2] * 2.0 - 0.5 + grid) * stride
+        anchor_broadcast = anchor.reshape(1, 1, 1, 3, 2)
+        pred_wh = (pred[..., 2:4] * 2.0) ** 2 * anchor_broadcast
+        
+        pred_conf = pred[..., 4]
+        pred_cls = pred[..., 5]
+        final_score = pred_conf * pred_cls
+        
+        mask = final_score > conf_thres
+        if not np.any(mask): continue
+            
+        valid_xy = pred_xy[mask]
+        valid_wh = pred_wh[mask]
+        valid_scores = final_score[mask]
+        
+        x1y1 = valid_xy - valid_wh / 2
+        valid_boxes = np.concatenate([x1y1, valid_wh], axis=1)
+        
+        boxes.extend(valid_boxes.tolist())
+        scores.extend(valid_scores.tolist())
+        class_ids.extend([0] * len(valid_scores))
+    return boxes, scores, class_ids
+
+# -------------------------------------------------
+# 1. System Monitor
 # -------------------------------------------------
 class SystemMonitor(threading.Thread):
     def __init__(self, interval=0.5):
@@ -320,11 +368,13 @@ class SystemMonitor(threading.Thread):
                 with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
                     self.stats["temp"] = int(f.read().strip()) / 1000.0
                 time.sleep(self.interval)
-            except: break
+            except: 
+                print("/sys/class/thermal/thermal_zone0/temp MATTER")
+                break
     def stop(self): self.running = False
 
 # -------------------------------------------------
-# 2. Benchmark Class (HailoRT 4.23.0 전용)
+# 2. Async Benchmark (Paper-Grade)
 # -------------------------------------------------
 class HailoAsyncBenchmark:
     def __init__(self, model_path):
@@ -334,7 +384,6 @@ class HailoAsyncBenchmark:
         self.target = VDevice(params)
         self.infer_model = self.target.create_infer_model(model_path)
         
-        # 입력/출력 포맷 명시적 설정
         self.infer_model.inputs[0].set_format_type(FormatType.UINT8)
         self.input_shape = self.infer_model.inputs[0].shape
         
@@ -348,31 +397,132 @@ class HailoAsyncBenchmark:
         self.output_info = []
         for output in self.infer_model.outputs:
             output.set_format_type(FormatType.FLOAT32)
-            self.output_info.append({
-                "name": output.name,
-                "shape": output.shape
-            })
+            self.output_info.append({"name": output.name, "shape": output.shape})
             
-        print(f"[INIT] Model has 1 input and {len(self.infer_model.outputs)} outputs.")
+        print(f"[INIT] Model Inputs: 1, Outputs: {len(self.infer_model.outputs)}")
 
+        self.POOL_SIZE = 15 # 논문 멘트: "We empirically selected POOL_SIZE=15 for optimal throughput"
+        self.NUM_WORKERS = 3  
+
+        self.buffer_pool = queue.Queue(maxsize=self.POOL_SIZE)
+        self.postprocess_queue = queue.Queue(maxsize=self.POOL_SIZE)
         self.log_queue = queue.Queue()
-        self.stop_event = threading.Event()
+        self.monitor = SystemMonitor()
 
-    def run_benchmark(self, video_path, max_frames=2000):
+    def postprocess_worker(self):
+        """CPU에서 BBox 디코딩 및 NMS를 수행하는 워커 스레드"""
+        while True:
+            item = self.postprocess_queue.get()
+            if item is None: # 종료 신호
+                self.postprocess_queue.task_done()
+                break
+                
+            f_id, t_e2e_st, t_inf_st, t_inf_end, rx, ry, bindings, input_buf, output_bufs = item
+
+            try:
+                # --- 1. 텐서 파싱 ---
+                try:
+                    det_8 = output_bufs['model/conv57']
+                    det_16 = output_bufs['model/conv65']
+                    det_32 = output_bufs['model/conv72']
+                    da_seg = output_bufs['model/ne_activation_activation1']
+                    ll_seg = output_bufs['model/ne_activation_activation2']
+                except KeyError:
+                    try:
+                        det_8 = next(v for k, v in output_bufs.items() if 'conv57' in k)
+                        det_16 = next(v for k, v in output_bufs.items() if 'conv65' in k)
+                        det_32 = next(v for k, v in output_bufs.items() if 'conv72' in k)
+                        da_seg = next(v for k, v in output_bufs.items() if 'activation1' in k)
+                        ll_seg = next(v for k, v in output_bufs.items() if 'activation2' in k)
+                    except StopIteration:
+                        print(f"\n[FATAL ERROR] 출력 텐서를 찾을 수 없습니다! 실제 딕셔너리 구조:")
+                        for k, v in output_bufs.items():
+                            print(f"  - Key: '{k}' | Shape: {v.shape}")
+                        os._exit(1)
+                
+                if len(det_8.shape) == 3:
+                    det_8 = np.expand_dims(det_8, axis=0)
+                    det_16 = np.expand_dims(det_16, axis=0)
+                    det_32 = np.expand_dims(det_32, axis=0)
+                if len(da_seg.shape) == 3:
+                    da_seg = np.expand_dims(da_seg, axis=0)
+                    ll_seg = np.expand_dims(ll_seg, axis=0)
+
+                # --- 2. NCHW -> NHWC 방어 코드 ---
+                if len(det_8.shape) == 4 and det_8.shape[1] == 18: 
+                    det_8 = np.transpose(det_8, (0, 2, 3, 1))
+                    det_16 = np.transpose(det_16, (0, 2, 3, 1))
+                    det_32 = np.transpose(det_32, (0, 2, 3, 1))
+                if len(da_seg.shape) == 4 and da_seg.shape[1] == 2:
+                    da_seg = np.transpose(da_seg, (0, 2, 3, 1))
+                    ll_seg = np.transpose(ll_seg, (0, 2, 3, 1))
+
+                # --- 3. Drivable & Lane Line Mask (증발했던 로직 복구!) ---
+                da_diff = da_seg[0][..., 1] - da_seg[0][..., 0]
+                da_mask = np.zeros_like(da_diff, dtype=np.uint8)
+                da_mask[da_diff > 0.0] = 1 
+                ll_mask = np.argmax(ll_seg[0], axis=-1).astype(np.uint8)
+
+                # --- 4. BBox 디코딩 및 NMS (증발했던 로직 복구!) ---
+                boxes, scores, class_ids = decode_detections([det_8, det_16, det_32], conf_thres=0.4)
+                final_boxes = []
+                for b in boxes:
+                    x1, y1, w, h = b
+                    final_boxes.append([int(x1 * rx), int(y1 * ry), int(w * rx), int(h * ry)])
+                
+                _ = cv2.dnn.NMSBoxes(final_boxes, scores, score_threshold=0.4, nms_threshold=0.45)
+
+            except Exception as e:
+                print(f"[WARN] Postprocess Error on frame {f_id}: {e}")
+
+            # [최적화 3] E2E Latency 측정 종료 시점
+            t_e2e_end = time.perf_counter()
+            t_now = time.time()
+            
+            # 정확하게 분리된 Latency 계산
+            infer_lat = (t_inf_end - t_inf_st) * 1000.0  # (PCIe 송신 + NPU + PCIe 수신)
+            e2e_lat = (t_e2e_end - t_e2e_st) * 1000.0    # (CPU 전처리 + Infer + CPU 후처리)
+            fps_e2e = 1000.0 / e2e_lat if e2e_lat > 0 else 0
+
+            # 로깅 큐에 저장 (스레드가 섞일 수 있으므로 frame_id 필수 포함)
+            self.log_queue.put((
+                f_id, t_now, fps_e2e, infer_lat, e2e_lat, 
+                self.monitor.stats["cpu"], self.monitor.stats["temp"]
+            ))
+
+            if f_id % 200 == 0:
+                print(f"[{f_id}] Infer: {infer_lat:.2f}ms | E2E: {e2e_lat:.2f}ms")
+
+            # 🌟 [핵심] 처리가 완전히 끝난 버퍼만 반납하여 NPU와 CPU 간 메모리 충돌 차단
+            self.buffer_pool.put((bindings, input_buf, output_bufs))
+            self.postprocess_queue.task_done()
+
+    def run_benchmark(self, video_path, max_frames=10000):
+        # [최적화] 프로세스 우선순위 격상 (OS 스케줄러 간섭 최소화)
+        try:
+            os.sched_setscheduler(os.getpid(), os.SCHED_FIFO, os.sched_param(99))
+            print("[INFO] Process Priority: REAL-TIME (FIFO 99)")
+        except: pass
+
         cap = cv2.VideoCapture(os.path.abspath(video_path))
-        monitor = SystemMonitor()
-        monitor.start()
-        results = []
+        if not cap.isOpened(): raise RuntimeError("Video Open Failed")
+
+        self.monitor.start()
         
-        print(f"[INFO] Starting 4.23.0 Async Benchmark...")
+        # 다중 후처리 워커 스레드 시작
+        workers = []
+        for _ in range(self.NUM_WORKERS):
+            t = threading.Thread(target=self.postprocess_worker, daemon=True)
+            t.start()
+            workers.append(t)
+        
+        print(f"[INFO] Started Async Benchmark (Workers: {self.NUM_WORKERS}, Pool: {self.POOL_SIZE})")
         
         with self.infer_model.configure() as configured_infer_model:
-            start_time_total = time.time()
+            start_time_global = time.time()
 
-            POOL_SIZE = 10  # 동시에 유지할 최대 비동기 파이프라인 개수
-            buffer_pool = queue.Queue(maxsize=POOL_SIZE)
-
-            for _ in range(POOL_SIZE):
+            # 버퍼 풀 사전 할당
+            for _ in range(self.POOL_SIZE):
                 bindings = configured_infer_model.create_bindings()
                 input_buf = np.empty(self.input_shape, dtype=np.uint8)
                 bindings.input(self.input_name).set_buffer(input_buf)
@@ -381,67 +531,103 @@ class HailoAsyncBenchmark:
                     out_buf = np.empty(out_info["shape"], dtype=np.float32)
                     bindings.output(out_info["name"]).set_buffer(out_buf)
                     output_bufs[out_info["name"]] = out_buf
+                self.buffer_pool.put((bindings, input_buf, output_bufs))
 
-                buffer_pool.put((bindings, input_buf, output_bufs))
-
-            print(f"[INFO] Allocated {POOL_SIZE} buffer sets. Measurement Started!")
-
-            for i in range(max_frames):
+            frame_id = 0
+            while frame_id < max_frames:
                 ret, frame = cap.read()
                 if not ret: break
 
-                # 1. 전처리
-                t_start = time.perf_counter()
+                # ⏱️ [E2E 시작]
+                t_e2e_st = time.perf_counter()
+
+                h0, w0 = frame.shape[:2]
+                rx, ry = w0 / self.in_w, h0 / self.in_h
+
                 resized = cv2.resize(frame, (self.in_w, self.in_h))
                 input_data = np.expand_dims(resized, axis=0)
 
-                bindings, input_buf, output_bufs = buffer_pool.get()
+                # 풀에서 버퍼 획득 (모든 버퍼가 후처리 중이면 대기)
+                bindings, input_buf, output_bufs = self.buffer_pool.get()
                 np.copyto(input_buf, input_data)
 
-                def get_callback(f_id, t_st, current_binding, curr_in, curr_outs):
+                # ⏱️ [순수 Infer 시작] (PCIe 전송 직전)
+                t_inf_st = time.perf_counter()
+
+                # 콜백 함수 (가장 가벼운 형태로 유지)
+                def get_callback(f_id, t_e2e, t_inf_s, r_x, r_y, current_binding, curr_in, curr_outs):
                     def cb(completion_info):
+                        # ⏱️ [순수 Infer 종료] (가속기 연산 완료 직후)
+                        t_inf_end = time.perf_counter()
+                        
                         if completion_info.exception:
                             print(f"[ERROR] Inference failed: {completion_info.exception}")
+                            self.buffer_pool.put((current_binding, curr_in, curr_outs))
                         else:
-                            t_end = time.perf_counter()
-                            e2e_lat = (t_end - t_st) * 1000.0
-                            self.log_queue.put((f_id, e2e_lat))
-                        buffer_pool.put((current_binding, curr_in, curr_outs))
+                            # 후처리 큐로 모든 시간값과 데이터 일괄 이관
+                            self.postprocess_queue.put((f_id, t_e2e, t_inf_s, t_inf_end, r_x, r_y, current_binding, curr_in, curr_outs))
                     return cb
 
-                # 비동기 실행
-                job = configured_infer_model.run_async([bindings], get_callback(i, t_start, bindings, input_buf, output_bufs))
+                job = configured_infer_model.run_async(
+                    [bindings], 
+                    get_callback(frame_id, t_e2e_st, t_inf_st, rx, ry, bindings, input_buf, output_bufs)
+                )
+                frame_id += 1
 
-                # 로그 큐에서 데이터 비워주기 (메모리 관리)
-                while not self.log_queue.empty():
-                    results.append(self.log_queue.get())
+            # NPU 파이프라인 정리 대기
+            if 'job' in locals(): job.wait(10000)
+            
+            # 후처리 큐가 다 비워질 때까지 대기 후 스레드 종료 신호
+            self.postprocess_queue.join()
+            for _ in range(self.NUM_WORKERS):
+                self.postprocess_queue.put(None)
+            for t in workers:
+                t.join()
+                
+            total_dur = time.time() - start_time_global
 
-            # 모든 작업 완료 대기
-            if 'job' in locals():
-                job.wait(10000)
-            total_duration = time.time() - start_time_total
-
-        # 종료 및 로깅
-        monitor.stop()
+        self.monitor.stop()
         cap.release()
 
+        # 다중 스레드 특성상 로그 순서가 뒤섞일 수 있으므로 정렬
+        logs = []
         while not self.log_queue.empty():
-            results.append(self.log_queue.get())
+            logs.append(self.log_queue.get())
+        logs.sort(key=lambda x: x[0]) # frame_id 기준으로 정렬
 
-        self._save_logs(results, total_duration, monitor.stats)
+        self._save_logs(logs, frame_id, total_dur)
 
-    def _save_logs(self, results, duration, stats):
-        avg_fps = len(results) / duration
-        print(f"\n[RESULT] Avg Throughput: {avg_fps:.2f} FPS")
+    def _save_logs(self, logs, total_frames, duration):
+        os.makedirs("logs", exist_ok=True)
+        log_path = f"logs/bench_rpi_async_paper_{datetime.now().strftime('%m%d_%H%M')}.csv"
+
+        with open(log_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Frame_ID", "Unix_Time", "Timestamp", "System_FPS", "Infer_Latency_ms", "E2E_Latency_ms", "CPU_Usage_Percent", "Temp_C"])
+
+            for log in logs:
+                fid, ts, fps, inf_lat, e2e_lat, cpu, tmp = log
+                ts_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S.%f")
+                writer.writerow([fid, f"{ts:.6f}", ts_str, f"{fps:.2f}", f"{inf_lat:.2f}", f"{e2e_lat:.2f}", cpu, tmp])
+
+        global_e2e_fps = total_frames / duration if duration > 0 else 0
+        avg_hdh_lat = np.mean([log[3] for log in logs]) if logs else 0
+        
+        print(f"\n[RESULT] Saved to {log_path}")
+        print(f"[RESULT] Avg HDH Latency (NPU Round-trip): {avg_hdh_lat:.2f} ms")
+        print(f"[RESULT] Global System Throughput (E2E)  : {global_e2e_fps:.2f} FPS")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', default='yolop_raw.hef')
-    parser.add_argument('--video', default='NonDureong.mp4')
+    parser.add_argument('--video', default='Video.mp4')
     args = parser.parse_args()
 
-    bench = HailoAsyncBenchmark(args.model)
-    bench.run_benchmark(args.video)
+    if os.path.exists(args.model) and os.path.exists(args.video):
+        bench = HailoAsyncBenchmark(args.model)
+        bench.run_benchmark(args.video, max_frames=10000)
+    else:
+        print("[ERROR] Model or Video file not found.")
 ```
 
 ```
