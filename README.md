@@ -35,6 +35,51 @@ from datetime import datetime
 from hailo_platform import (HEF, VDevice, HailoStreamInterface, ConfigureParams, 
                             InputVStreamParams, OutputVStreamParams, FormatType, InferVStreams)
 
+ANCHORS = [
+    [[3, 9], [5, 11], [4, 20]],       # Stride 8
+    [[7, 18], [6, 39], [12, 31]],     # Stride 16
+    [[19, 50], [38, 81], [68, 157]]   # Stride 32
+]
+STRIDES = [8, 16, 32]
+
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
+def decode_detections(det_outputs, conf_thres=0.4):
+    boxes, scores, class_ids = [], [], []
+    for i, pred in enumerate(det_outputs):
+        stride = STRIDES[i]
+        anchor = np.array(ANCHORS[i])
+        bs, h, w, ch = pred.shape
+        pred = pred.reshape(bs, h, w, 3, 6)
+        pred = sigmoid(pred)
+        
+        grid_x, grid_y = np.meshgrid(np.arange(w), np.arange(h))
+        grid = np.stack((grid_x, grid_y), axis=2).reshape(1, h, w, 1, 2)
+
+        pred_xy = (pred[..., 0:2] * 2.0 - 0.5 + grid) * stride
+        anchor_broadcast = anchor.reshape(1, 1, 1, 3, 2)
+        pred_wh = (pred[..., 2:4] * 2.0) ** 2 * anchor_broadcast
+        
+        pred_conf = pred[..., 4]
+        pred_cls = pred[..., 5]
+        final_score = pred_conf * pred_cls
+        
+        mask = final_score > conf_thres
+        if not np.any(mask): continue
+            
+        valid_xy = pred_xy[mask]
+        valid_wh = pred_wh[mask]
+        valid_scores = final_score[mask]
+        
+        x1y1 = valid_xy - valid_wh / 2
+        valid_boxes = np.concatenate([x1y1, valid_wh], axis=1)
+        
+        boxes.extend(valid_boxes.tolist())
+        scores.extend(valid_scores.tolist())
+        class_ids.extend([0] * len(valid_scores))
+    return boxes, scores, class_ids
+
 # -------------------------------------------------
 # 1. System Monitor (Threaded)
 # -------------------------------------------------
@@ -99,7 +144,7 @@ def run_final_benchmark_rpi(model_path, video_path):
         monitor.start()
 
         # 로그 버퍼 (Infer_Lat와 E2E_Lat 두 개 저장)
-        MAX_FRAMES = 5000
+        MAX_FRAMES = 10000
         # (Frame_ID, Timestamp, FPS, Infer_Lat, E2E_Lat, CPU, Temp)
         log_buffer = [None] * MAX_FRAMES 
         frame_id = 0
@@ -124,6 +169,11 @@ def run_final_benchmark_rpi(model_path, video_path):
                         ret, frame = cap.read()
                         if not ret: break
 
+                        # 원본 이미지의 크기를 가져와 가로/세로 비율 계산
+                        h0, w0 = frame.shape[:2]
+                        rx = w0 / in_w
+                        ry = h0 / in_h
+
                         # [A] E2E 시작 시간 측정
                         t_now = time.time()
                         t_e2e_start = time.perf_counter()
@@ -143,8 +193,39 @@ def run_final_benchmark_rpi(model_path, video_path):
                         t_infer_end = time.perf_counter()
 
                         # 3. CPU Postprocessing (Minimal)
-                        _ = list(output.values())
+                        try:
+                            det_8 = output['model/conv57']
+                            det_16 = output['model/conv65']
+                            det_32 = output['model/conv72']
+                            da_seg = output['model/ne_activation_activation1']
+                            ll_seg = output['model/ne_activation_activation2']
+                        except KeyError:
+                            vals = list(output.values())
+                            det_outs = [v for v in vals if len(v.shape) == 4 and v.shape[3] == 18]
+                            seg_outs = [v for v in vals if len(v.shape) == 4 and v.shape[3] == 2]
+                            det_outs.sort(key=lambda x: x.shape[1], reverse=True) 
+                            det_8, det_16, det_32 = det_outs[0], det_outs[1], det_outs[2]
+                            da_seg, ll_seg = seg_outs[0], seg_outs[1]
 
+                        # 3-1. Drivable & Lane Line Mask 처리
+                        da_diff = da_seg[0][..., 1] - da_seg[0][..., 0]
+                        da_mask = np.zeros_like(da_diff, dtype=np.uint8)
+                        da_mask[da_diff > 0.0] = 1 
+                        ll_mask = np.argmax(ll_seg[0], axis=-1).astype(np.uint8)
+
+                        # 3-2. Object Detection 디코딩 및 NMS
+                        boxes, scores, class_ids = decode_detections([det_8, det_16, det_32], conf_thres=0.4)
+                        final_boxes = []
+                        for b in boxes:
+                            x1, y1, w, h = b
+                            # [수정된 부분] letterbox 공식(dw, dh, r) 대신 단순 비율(rx, ry)을 곱해 좌표 복원
+                            x1 = x1 * rx
+                            y1 = y1 * ry
+                            w = w * rx
+                            h = h * ry
+                            final_boxes.append([int(x1), int(y1), int(w), int(h)])
+                        
+                        _ = cv2.dnn.NMSBoxes(final_boxes, scores, score_threshold=0.4, nms_threshold=0.45)
                         # [D] E2E 종료 시간 측정
                         t_e2e_end = time.perf_counter()
 
@@ -197,7 +278,7 @@ def run_final_benchmark_rpi(model_path, video_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', default='yolop_raw.hef', help='Path to .hef model') 
-    parser.add_argument('--video', default='NonDureong.mp4', help='Input video')
+    parser.add_argument('--video', default='Video.mp4', help='Input video')
     args = parser.parse_args()
 
     if os.path.exists(args.model) and os.path.exists(args.video):
