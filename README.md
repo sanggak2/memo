@@ -308,8 +308,10 @@ if __name__ == "__main__":
 import time
 import argparse
 import os
+os.environ["HAILO_PROFILER_ENABLE"] = "1"
+os.environ["HAILO_TRACE_ENABLE"] = "1"
 import cv2
-cv2.setNumThreads(1) # [변인통제] OpenCV 다중 스레드 개입 차단
+cv2.setNumThreads(1)
 import numpy as np
 import psutil
 import csv
@@ -320,7 +322,7 @@ from datetime import datetime
 from hailo_platform import VDevice, FormatType, HailoSchedulingAlgorithm
 
 # -------------------------------------------------
-# 0. YOLOP Post-Processing Constants & Utils (동일)
+# 0. YOLOP Post-Processing Constants & Utils
 # -------------------------------------------------
 ANCHORS = [[[3, 9], [5, 11], [4, 20]], [[7, 18], [6, 39], [12, 31]], [[19, 50], [38, 81], [68, 157]]]
 STRIDES = [8, 16, 32]
@@ -381,13 +383,13 @@ class SystemMonitor(threading.Thread):
                     with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
                         self.stats["temp"] = int(f.read().strip()) / 1000.0
                 except:
-                    self.stats["temp"] = 0.0 # 파일 접근 실패 시 방어
+                    self.stats["temp"] = 0.0
                 time.sleep(self.interval)
             except: break
     def stop(self): self.running = False
 
 # -------------------------------------------------
-# 2. Fair Async Benchmark
+# 2. Pre/Post Independent Async Benchmark
 # -------------------------------------------------
 class HailoAsyncBenchmark:
     def __init__(self, model_path):
@@ -411,9 +413,8 @@ class HailoAsyncBenchmark:
             output.set_format_type(FormatType.FLOAT32)
             self.output_info.append({"name": output.name, "shape": output.shape})
 
-        # [변수 통제] 과도한 스위칭 방지를 위해 Worker는 1개만 둬서 Sync와 CPU 사용 패턴을 유사하게 맞춤
-        self.POOL_SIZE = 10
-        self.NUM_WORKERS = 1 
+        self.POOL_SIZE = 7
+        self.NUM_WORKERS = 2 
 
         self.buffer_pool = queue.Queue(maxsize=self.POOL_SIZE)
         self.postprocess_queue = queue.Queue(maxsize=self.POOL_SIZE)
@@ -427,7 +428,11 @@ class HailoAsyncBenchmark:
                 self.postprocess_queue.task_done()
                 break
                 
-            f_id, t_e2e_st, t_inf_st, t_inf_end, rx, ry, bindings, input_buf, output_bufs = item
+            # 메인 스레드에서 측정한 pre_lat을 함께 전달받음
+            f_id, pre_lat, rx, ry, bindings, input_buf, output_bufs = item
+
+            # 🔥 [독립 측정] 후처리 시작 시간
+            t_post_st = time.perf_counter()
 
             try:
                 try:
@@ -439,6 +444,13 @@ class HailoAsyncBenchmark:
                     det_32 = next(v for k, v in output_bufs.items() if 'conv72' in k)
                     da_seg = next(v for k, v in output_bufs.items() if 'activation1' in k)
                     ll_seg = next(v for k, v in output_bufs.items() if 'activation2' in k)
+                
+                if len(det_8.shape) == 3:
+                    det_8 = np.expand_dims(det_8, axis=0)
+                    det_16 = np.expand_dims(det_16, axis=0)
+                    det_32 = np.expand_dims(det_32, axis=0)
+                    da_seg = np.expand_dims(da_seg, axis=0)
+                    ll_seg = np.expand_dims(ll_seg, axis=0)
                 
                 if len(det_8.shape) == 4 and det_8.shape[1] == 18: 
                     det_8 = np.transpose(det_8, (0, 2, 3, 1))
@@ -459,20 +471,20 @@ class HailoAsyncBenchmark:
                     final_boxes.append([int(x1 * rx), int(y1 * ry), int(w * rx), int(h * ry)])
                 _ = cv2.dnn.NMSBoxes(final_boxes, scores, score_threshold=0.4, nms_threshold=0.45)
 
-            except Exception as e: pass
+            except Exception as e: 
+                print(f"[DEBUG]post-process Error at frame {f_id}: {e}")
 
-            # [공정 평가] Sync와 완전히 동일한 구간에서 E2E 종료 시간 측정
-            t_e2e_end = time.perf_counter()
+            # 🔥 [독립 측정] 후처리 종료 시간
+            t_post_end = time.perf_counter()
+            post_lat = (t_post_end - t_post_st) * 1000.0
+
             t_now = time.time()
             
-            infer_lat = (t_inf_end - t_inf_st) * 1000.0  # (run_async ~ callback)
-            e2e_lat = (t_e2e_end - t_e2e_st) * 1000.0    # 단일 프레임 처리 속도 (Instant)
-            fps_inst = 1000.0 / e2e_lat if e2e_lat > 0 else 0 
-
-            self.log_queue.put((f_id, t_now, fps_inst, infer_lat, e2e_lat, self.monitor.stats["cpu"], self.monitor.stats["temp"]))
+            # 로깅 큐에 전처리 시간과 후처리 시간을 분리해서 전송
+            self.log_queue.put((f_id, t_now, pre_lat, post_lat, self.monitor.stats["cpu"], self.monitor.stats["temp"]))
 
             if f_id % 200 == 0:
-                print(f"[{f_id}] Infer: {infer_lat:.2f}ms | E2E: {e2e_lat:.2f}ms")
+                print(f"[{f_id}] Pre: {pre_lat:.2f}ms | Post: {post_lat:.2f}ms")
 
             self.buffer_pool.put((bindings, input_buf, output_bufs))
             self.postprocess_queue.task_done()
@@ -501,29 +513,23 @@ class HailoAsyncBenchmark:
                     output_bufs[out_info["name"]] = out_buf
                 self.buffer_pool.put((bindings, input_buf, output_bufs))
 
-            # ---------------------------------------------------------
-            # [변인통제] Sync 코드와 동일한 Warmup 절차 이식
-            # ---------------------------------------------------------
             print("[INFO] Warming up pipeline...")
             for _ in range(30): cap.read()
             for _ in range(50):
                 bindings, input_buf, output_bufs = self.buffer_pool.get()
                 np.copyto(input_buf, np.zeros(self.input_shape, dtype=np.uint8))
                 
-                # [수정됨] 람다 대신 안전한 클로저 함수로 버퍼 캡처 및 반납
                 def get_dummy_cb(b, i_b, o_b):
                     def cb(completion_info):
                         self.buffer_pool.put((b, i_b, o_b))
                     return cb
                 
                 job = configured_infer_model.run_async([bindings], get_dummy_cb(bindings, input_buf, output_bufs))
-                if 'job' in locals(): job.wait(5000)
+                
+            if 'job' in locals(): job.wait(5000)
             
-            # ---------------------------------------------------------
-            # [변인통제] 가비지 컬렉터 끄기 (동기 코드와 환경 동일화)
-            # ---------------------------------------------------------
             gc.disable()
-            print("[INFO] Fair Measurement Started!")
+            print("[INFO] Pre/Post Breakdown Measurement Started!")
             start_time_global = time.time()
 
             frame_id = 0
@@ -531,28 +537,33 @@ class HailoAsyncBenchmark:
                 ret, frame = cap.read()
                 if not ret: break
 
-                t_e2e_st = time.perf_counter()
                 h0, w0 = frame.shape[:2]
                 rx, ry = w0 / self.in_w, h0 / self.in_h
 
+                # 🔥 [독립 측정] 전처리 시작 시간
+                t_pre_st = time.perf_counter()
+                
                 resized = cv2.resize(frame, (self.in_w, self.in_h))
                 input_data = np.expand_dims(resized, axis=0)
+                
+                # 🔥 [독립 측정] 전처리 종료 시간
+                t_pre_end = time.perf_counter()
+                pre_lat = (t_pre_end - t_pre_st) * 1000.0
 
                 bindings, input_buf, output_bufs = self.buffer_pool.get()
                 np.copyto(input_buf, input_data)
 
-                t_inf_st = time.perf_counter()
-
-                def get_callback(f_id, t_e2e, t_inf_s, r_x, r_y, current_binding, curr_in, curr_outs):
+                # NPU 시간(t_inf_st)은 큐 간섭이 심하므로 과감히 제거하고 전처리 시간을 콜백으로 넘김
+                def get_callback(f_id, pre_l, r_x, r_y, current_binding, curr_in, curr_outs):
                     def cb(completion_info):
-                        t_inf_end = time.perf_counter() # Callback 진입 즉시 측정
+                        
                         if completion_info.exception:
                             self.buffer_pool.put((current_binding, curr_in, curr_outs))
                         else:
-                            self.postprocess_queue.put((f_id, t_e2e, t_inf_s, t_inf_end, r_x, r_y, current_binding, curr_in, curr_outs))
+                            self.postprocess_queue.put((f_id, pre_l, r_x, r_y, current_binding, curr_in, curr_outs))
                     return cb
 
-                job = configured_infer_model.run_async([bindings], get_callback(frame_id, t_e2e_st, t_inf_st, rx, ry, bindings, input_buf, output_bufs))
+                job = configured_infer_model.run_async([bindings], get_callback(frame_id, pre_lat, rx, ry, bindings, input_buf, output_bufs))
                 frame_id += 1
 
             if 'job' in locals(): job.wait(10000)
@@ -563,7 +574,6 @@ class HailoAsyncBenchmark:
                 
             total_dur = time.time() - start_time_global
 
-        # 측정 종료 후 GC 켜기
         gc.enable()
         self.monitor.stop()
         cap.release()
@@ -576,18 +586,19 @@ class HailoAsyncBenchmark:
 
     def _save_logs(self, logs, total_frames, duration):
         os.makedirs("logs", exist_ok=True)
-        log_path = f"logs/bench_rpi_async_fair_{datetime.now().strftime('%m%d_%H%M')}.csv"
+        log_path = f"logs/bench_rpi_async_breakdown_{datetime.now().strftime('%m%d_%H%M')}.csv"
 
         with open(log_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["Frame_ID", "Unix_Time", "Timestamp", "Real_Throughput_FPS", "HDH_Latency_ms", "E2E_Latency_ms", "CPU_Usage_Percent", "Temp_C"])
+            # 🔥 CSV 헤더 교체: Infer, E2E 대신 Pre_Latency, Post_Latency 배치
+            writer.writerow(["Frame_ID", "Unix_Time", "Timestamp", "Real_Throughput_FPS", "Pre_Latency_ms", "Post_Latency_ms", "CPU_Usage_Percent", "Temp_C"])
 
             prev_time = logs[0][1] if logs else 0
             for i, log in enumerate(logs):
-                fid, ts, _, hdh_lat, e2e_lat, cpu, tmp = log
+                fid, ts, pre_lat, post_lat, cpu, tmp = log
                 
                 if i == 0:
-                    real_fps = 0.0 # 첫 프레임은 비교 대상이 없으므로 0
+                    real_fps = 0.0
                 else:
                     time_diff = ts - prev_time
                     real_fps = 1.0 / time_diff if time_diff > 0 else 0.0
@@ -595,15 +606,23 @@ class HailoAsyncBenchmark:
 
                 writer.writerow([
                     fid, f"{ts:.6f}", datetime.fromtimestamp(ts).strftime("%H:%M:%S.%f"), 
-                    f"{real_fps:.2f}", f"{hdh_lat:.2f}", f"{e2e_lat:.2f}", cpu, tmp
+                    f"{real_fps:.2f}", f"{pre_lat:.2f}", f"{post_lat:.2f}", cpu, tmp
                 ])
 
         global_e2e_fps = total_frames / duration if duration > 0 else 0
-        avg_hdh_lat = np.mean([log[4] for log in logs]) if logs else 0
+        avg_pre_lat = np.mean([log[2] for log in logs]) if logs else 0
+        avg_post_lat = np.mean([log[3] for log in logs]) if logs else 0
         
         print(f"\n[RESULT] Saved to {log_path}")
-        print(f"[RESULT] Avg HDH Latency (NPU Round-trip): {avg_hdh_lat:.2f} ms")
-        print(f"[RESULT] Global System Throughput (E2E)  : {global_e2e_fps:.2f} FPS")
+        print(f"[RESULT] Avg Pre-processing Latency : {avg_pre_lat:.2f} ms")
+        print(f"[RESULT] Avg Post-processing Latency: {avg_post_lat:.2f} ms")
+        print(f"[RESULT] Global System Throughput   : {global_e2e_fps:.2f} FPS")
+
+        try:
+            self.target.release()
+        except:
+            print("dd")
+            pass
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -612,7 +631,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if os.path.exists(args.model) and os.path.exists(args.video):
         bench = HailoAsyncBenchmark(args.model)
-        bench.run_benchmark(args.video, max_frames=2000)
+        bench.run_benchmark(args.video, max_frames=1000)
+    
+    print("destroy")
+    del bench.infer_model
+    del bench.target
+    import gc
+    gc.collect()
 ```
 
 GStreamer 비동기
