@@ -762,7 +762,7 @@ class GstHailoBenchmark:
             f"videoscale name=pre_scale ! " # 전처리 시작 지점
             f"video/x-raw,width={self.IN_W},height={self.IN_H},format=RGB ! "
             f"hailonet name=npu_infer hef-path={model_path} scheduling-algorithm=1 ! " # 추론 지점
-            f"appsink name=mysink emit-signals=true max-buffers=1 drop=true"
+            f"appsink name=mysink emit-signals=true max-buffers=1 drop=true sync=false"
         )
         print(f"[INFO] Pipeline: {pipeline_str}")
         self.pipeline = Gst.parse_launch(pipeline_str)
@@ -820,7 +820,7 @@ class GstHailoBenchmark:
             np_arr = np.array(tensor)
             output_bufs[name] = np_arr
 
-        # YOLOP 후처리 로직 (기존 코드와 동일)
+        # YOLOP 후처리 로직 
         try:
             # 이름 매칭 로직 (TAPPAS는 레이어 이름이 다소 다르게 찍힐 수 있으므로 방어적 코드 작성)
             det_8 = next(v for k, v in output_bufs.items() if 'conv57' in k)
@@ -839,7 +839,9 @@ class GstHailoBenchmark:
             boxes, scores, class_ids = decode_detections([det_8, det_16, det_32], rx=self.rx, ry=self.ry)
             _ = cv2.dnn.NMSBoxes(boxes, scores, score_threshold=0.4, nms_threshold=0.45)
         except Exception as e:
-            pass # 초기 Warmup 중 에러 무시
+            if self.frame_count < 3:
+                print(f"\n[DEBUG] 후처리 에러 발생: {e}")
+                print(f"[DEBUG] 현재 TAPPAS가 보내는 텐서 이름들: {list(output_bufs.keys())}")
 
         t_post_end = time.perf_counter()
 
@@ -871,14 +873,35 @@ class GstHailoBenchmark:
         self.pipeline.set_state(Gst.State.PLAYING)
         
         # GStreamer 메인 루프 실행 (C언어 레벨에서 백그라운드 구동)
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
         loop = GLib.MainLoop()
+
+        def on_message(bus, message):
+            t = message.type
+            if t == Gst.MessageType.EOS:
+                print(f"\n[INFO] 비디오 끝(EOS) 도달! (총 {self.frame_count} 프레임 처리 완료)")
+                loop.quit() # 영상이 끝나면 루프 강제 종료
+            elif t == Gst.MessageType.ERROR:
+                err, debug = message.parse_error()
+                print(f"\n[ERROR] {err}: {debug}")
+                loop.quit()
+            return True
+
+        # 버스에 콜백 함수 연결
+        bus.connect("message", on_message)
+        self.pipeline.set_state(Gst.State.PLAYING)
         
         # 최대 프레임 또는 종료 이벤트를 감지하기 위한 스레드
         def check_stop():
             while self.frame_count < max_frames:
+                if not loop.is_running(): 
+                    break
                 time.sleep(1)
-            print("[INFO] Max frames reached. Stopping...")
-            loop.quit()
+                
+            if self.frame_count >= max_frames:
+                print("[INFO] Max frames reached. Stopping...")
+                loop.quit()
             
         threading.Thread(target=check_stop, daemon=True).start()
         
